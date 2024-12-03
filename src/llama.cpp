@@ -3384,12 +3384,14 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_split(const llama_mo
     ggml_backend_buffer_type_t buft = nullptr;
 
 #ifdef GGML_USE_CUDA
-    // TODO 打破只能多个GPU按行分配的限制，使用CPU和GPU进行按行分配
+    // Breaking the limitation that only multiple GPUs can be allocated on a per-row basis
     buft = ggml_backend_cuda_split_buffer_type(tensor_split);
 #endif
 
     if (buft == nullptr) {
         buft = llama_default_buffer_type_offload(model, fallback_gpu);
+    } else {
+        LLAMA_LOG_INFO("%s: breaking one device\n", __func__);
     }
     return buft;
 
@@ -6659,68 +6661,21 @@ static bool llm_load_tensors(
     model.n_gpu_layers = n_gpu_layers;
 
     const int n_layer     = hparams.n_layer;
-    // TODO 不再需要给GPU分配指定层，指定一个tensor_split分割比例，将该百分比的张量加载进GPU，剩余的全部在CPU中进行处理
-    // const int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
     bool use_mmap_buffer = true;
 
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    model.buft_input = llama_default_buffer_type_cpu(true); // CPU暂时缓存全部张量
-    //model.buft_input = llama_default_buffer_type_offload(main_gpu);
+    model.buft_input = llama_default_buffer_type_cpu(true); // CPU temporarily caches all tensors
 
-    model.buft_layer.resize(n_layer); // TODO 调整buft_layer的向量大小为层数
+    model.buft_layer.resize(n_layer); // The number of model layers remains the same
 
-    // assign cpu layers
-    // TODO 分配给CPU的层读入，我们要做的是将每一层的前几行读入，而不是正行读入，所以这个地方可以删除
-    // for (int i = 0; i < i_gpu_start; ++i) {
-    //     model.buft_layer[i] = llama_default_buffer_type_cpu(true);
-    // }
-
-    // if (split_mode == LLAMA_SPLIT_MODE_LAYER) {
-    //     // calculate the split points
-    //     int device_count = llama_get_device_count(model);
-    //     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + device_count, [](float x) { return x == 0.0f; });
-    //     std::vector<float> splits(device_count);
-    //     if (all_zero) {
-    //         // default split, by free memory
-    //         for (int i = 0; i < device_count; ++i) {
-    //             splits[i] = llama_get_device_memory(model, i);
-    //         }
-    //     } else {
-    //         std::copy(tensor_split, tensor_split + device_count, splits.begin());
-    //     }
-    //
-    //     // sum and normalize the splits to get the split points
-    //     float split_sum = 0.0f;
-    //     for (int i = 0; i < device_count; ++i) {
-    //         split_sum += splits[i];
-    //         splits[i] = split_sum;
-    //     }
-    //     for (int i = 0; i < device_count; ++i) {
-    //         splits[i] /= split_sum;
-    //     }
-    //
-    //     // assign the repeating layers to the devices according to the splits
-    //     int act_gpu_layers = std::min(n_gpu_layers, (int)n_layer + 1);
-    //     for (int i = i_gpu_start; i < n_layer; ++i) {
-    //         int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(i - i_gpu_start)/act_gpu_layers) - splits.begin();
-    //         model.buft_layer[i] = llama_default_buffer_type_offload(model, layer_gpu);
-    //     }
-    //     // assign the output layer
-    //     if (n_gpu_layers > n_layer) {
-    //         int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(act_gpu_layers - 1)/act_gpu_layers) - splits.begin();
-    //         model.buft_output = llama_default_buffer_type_offload(model, layer_gpu);
-    //     } else {
-    //         model.buft_output = llama_default_buffer_type_cpu(true);
-    //     }
-    // }
-
-    // TODO 直接按行进行读取，split_buft是预先规划的缓冲区
+    // 直接按行进行读取，split buffer是预先规划的缓冲区
     ggml_backend_buffer_type_t split_buft;
+    LLAMA_LOG_INFO("%s: tensor_split = %.2f \n", __func__, tensor_split);
     if (split_mode == LLAMA_SPLIT_MODE_ROW) {
-        // TODO llama.cpp要求是多个GPU之间的，我们要做的是将张量在CPU和GPU之间的进行分配，打破单个GPU不能进行按行分配的限制
+        // Allocate tensors between CPUs and GPUs
         split_buft = llama_default_buffer_type_split(model, main_gpu, tensor_split);
     } else {
-        // TODO 默认情况将模型全部加载到GPU进行处理
+        // default loads the model all the way to the GPU for processing
         split_buft = llama_default_buffer_type_offload(model, main_gpu);
     }
     // TODO 读入的过程中就需要进行内存空间占用率的判断，大于80%的时候就得进行模型清退
@@ -6730,8 +6685,7 @@ static bool llm_load_tensors(
             llama_default_buffer_type_offload(model, main_gpu)
         };
     }
-    // assign the output layer
-    // TODO 全部的输出层在GPU进行处理
+    // assign the output layer: The full output layer is processed in the GPU
     model.buft_output = {
         split_buft,
         llama_default_buffer_type_offload(model, main_gpu)
