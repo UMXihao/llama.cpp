@@ -16200,8 +16200,6 @@ static int llama_decode_internal(
 
         // TODO 计算图也需要进行分支处理
         ggml_cgraph * gf = llama_build_graph(lctx, ubatch, false);
-        // 新的计算图
-        ggml_cgraph * new_gf = llama_build_graph(lctx, ubatch, false);
 
         // the output is always the last tensor in the graph
         struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
@@ -16231,16 +16229,7 @@ static int llama_decode_internal(
 
         llama_set_inputs(lctx, ubatch);
 
-        // batch_all.all_pos_0 = 0,说明是prefill阶段
-        if (batch_all.all_pos_0 == 0) {
-            llama_graph_compute(lctx, gf, n_threads, threadpool);
-        } else {
-            // TODO 解码阶段需要修改原始的计算图，能够并行处理，否则将造成重复写入问题
-            std::thread origin(llama_graph_compute, lctx, gf, n_threads, threadpool);
-            std::thread new_thread(llama_graph_compute, lctx, new_gf, n_threads, threadpool);
-            origin.join();
-            new_thread.join();
-        }
+        llama_graph_compute(lctx, gf, n_threads, threadpool);
 
         // update the kv ring buffer
         {
