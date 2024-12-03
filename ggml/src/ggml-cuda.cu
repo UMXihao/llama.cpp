@@ -945,21 +945,25 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(const f
 
     std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split_arr = {};
 
+	// TODO 检查tensor_split是否为空或者数组中的所有元素是否都等于0.0f
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + GGML_CUDA_MAX_DEVICES, [](float x) { return x == 0.0f; });
     if (all_zero) {
         tensor_split_arr = ggml_cuda_info().default_tensor_split;
     } else {
-        float split_sum = 0.0f;
-        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
-            tensor_split_arr[i] = split_sum;
-            split_sum += tensor_split[i];
-        }
-        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
-            tensor_split_arr[i] /= split_sum;
-        }
+      	// TODO ggml_backend_cuda_get_device_count==1，其他张量需要分配给CPU
+        tensor_split_arr[0] = tensor_split[0];
+//        float split_sum = 0.0f;
+//        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+//            tensor_split_arr[i] = split_sum;
+//            split_sum += tensor_split[i];
+//        }
+//        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+//            tensor_split_arr[i] /= split_sum;
+//        }
     }
 
     auto it = buft_map.find(tensor_split_arr);
+    // TODO 没有找到对应的键值
     if (it != buft_map.end()) {
         return &it->second;
     }

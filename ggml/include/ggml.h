@@ -714,7 +714,9 @@ extern "C" {
         bool   no_alloc;   // don't allocate memory for the tensor data
     };
 
-    // numa strategies
+    // numa strategies NUMA（Non-Uniform Memory Access）内存分配策略。
+    // NUMA 是一种计算机内存设计，其中内存访问时间取决于内存相对于处理器的位置。
+    // 在多处理器系统中，每个处理器都有局部内存（最近的、最快的内存），以及全局内存（更远的、访问速度较慢的内存）
     enum ggml_numa_strategy {
         GGML_NUMA_STRATEGY_DISABLED   = 0,
         GGML_NUMA_STRATEGY_DISTRIBUTE = 1,

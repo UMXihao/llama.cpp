@@ -18959,6 +18959,7 @@ static void ggml_build_forward_impl(struct ggml_cgraph * cgraph, struct ggml_ten
 
     const int n0 = cgraph->n_nodes;
 
+    // TODO 这里是个递归处理，会修改cgraph->n_nodes的值
     ggml_visit_parents(cgraph, tensor);
 
     const int n_new = cgraph->n_nodes - n0;
@@ -22059,7 +22060,7 @@ static size_t gguf_type_size(enum gguf_type type) {
 }
 
 static void gguf_tensor_info_sanitize(struct gguf_tensor_info * info) {
-    GGML_ASSERT(info->n_dims <= GGML_MAX_DIMS);
+    GGML_ASSERT(info->n_dims <= GGML_MAX_DIMS); // 张量维度为4维
     GGML_ASSERT(0 <= info->type && info->type < GGML_TYPE_COUNT);
 
     for (uint32_t i = 0; i < info->n_dims; ++i) {
@@ -22073,6 +22074,7 @@ static void gguf_tensor_info_sanitize(struct gguf_tensor_info * info) {
 }
 
 static bool gguf_fread_el(FILE * file, void * dst, size_t size, size_t * offset) {
+    // 将文件流读入缓冲区dst，
     const size_t n = fread(dst, 1, size, file);
     *offset += n;
     return n == size;
@@ -22412,7 +22414,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
             .mem_buffer = NULL,
             .no_alloc   = params.no_alloc,
         };
-
+        // 上下文赋值
         *params.ctx = ggml_init(pdata);
         if (*params.ctx == NULL) {
             fprintf(stderr, "%s: failed to initialize context\n", __func__);

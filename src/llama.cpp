@@ -3384,15 +3384,8 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_split(const llama_mo
     ggml_backend_buffer_type_t buft = nullptr;
 
 #ifdef GGML_USE_CUDA
-    if (ggml_backend_cuda_get_device_count() > 1) {
-        buft = ggml_backend_cuda_split_buffer_type(tensor_split);
-    }
-#endif
-
-#ifdef GGML_USE_SYCL
-    if (ggml_backend_sycl_get_device_count() > 1) {
-        buft = ggml_backend_sycl_split_buffer_type(tensor_split);
-    }
+    // TODO 打破只能多个GPU按行分配的限制，使用CPU和GPU进行按行分配
+    buft = ggml_backend_cuda_split_buffer_type(tensor_split);
 #endif
 
     if (buft == nullptr) {
@@ -4304,7 +4297,7 @@ struct llama_model_loader {
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {
             /*.no_alloc = */ true,
-            /*.ctx      = */ &ctx,
+            /*.ctx      = */ &ctx, // params中已经引用ctx，params的变更将导致上下文变更
         };
 
         meta = gguf_init_from_file(fname.c_str(), params);
@@ -6666,82 +6659,83 @@ static bool llm_load_tensors(
     model.n_gpu_layers = n_gpu_layers;
 
     const int n_layer     = hparams.n_layer;
-    const int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
+    // TODO 不再需要给GPU分配指定层，指定一个tensor_split分割比例，将该百分比的张量加载进GPU，剩余的全部在CPU中进行处理
+    // const int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
     bool use_mmap_buffer = true;
 
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    model.buft_input = llama_default_buffer_type_cpu(true);
+    model.buft_input = llama_default_buffer_type_cpu(true); // CPU暂时缓存全部张量
     //model.buft_input = llama_default_buffer_type_offload(main_gpu);
 
-    model.buft_layer.resize(n_layer);
+    model.buft_layer.resize(n_layer); // TODO 调整buft_layer的向量大小为层数
 
     // assign cpu layers
-    for (int i = 0; i < i_gpu_start; ++i) {
-        model.buft_layer[i] = llama_default_buffer_type_cpu(true);
-    }
+    // TODO 分配给CPU的层读入，我们要做的是将每一层的前几行读入，而不是正行读入，所以这个地方可以删除
+    // for (int i = 0; i < i_gpu_start; ++i) {
+    //     model.buft_layer[i] = llama_default_buffer_type_cpu(true);
+    // }
 
-    if (split_mode == LLAMA_SPLIT_MODE_LAYER) {
-        // calculate the split points
-        int device_count = llama_get_device_count(model);
-        bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + device_count, [](float x) { return x == 0.0f; });
-        std::vector<float> splits(device_count);
-        if (all_zero) {
-            // default split, by free memory
-            for (int i = 0; i < device_count; ++i) {
-                splits[i] = llama_get_device_memory(model, i);
-            }
-        } else {
-            std::copy(tensor_split, tensor_split + device_count, splits.begin());
-        }
+    // if (split_mode == LLAMA_SPLIT_MODE_LAYER) {
+    //     // calculate the split points
+    //     int device_count = llama_get_device_count(model);
+    //     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + device_count, [](float x) { return x == 0.0f; });
+    //     std::vector<float> splits(device_count);
+    //     if (all_zero) {
+    //         // default split, by free memory
+    //         for (int i = 0; i < device_count; ++i) {
+    //             splits[i] = llama_get_device_memory(model, i);
+    //         }
+    //     } else {
+    //         std::copy(tensor_split, tensor_split + device_count, splits.begin());
+    //     }
+    //
+    //     // sum and normalize the splits to get the split points
+    //     float split_sum = 0.0f;
+    //     for (int i = 0; i < device_count; ++i) {
+    //         split_sum += splits[i];
+    //         splits[i] = split_sum;
+    //     }
+    //     for (int i = 0; i < device_count; ++i) {
+    //         splits[i] /= split_sum;
+    //     }
+    //
+    //     // assign the repeating layers to the devices according to the splits
+    //     int act_gpu_layers = std::min(n_gpu_layers, (int)n_layer + 1);
+    //     for (int i = i_gpu_start; i < n_layer; ++i) {
+    //         int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(i - i_gpu_start)/act_gpu_layers) - splits.begin();
+    //         model.buft_layer[i] = llama_default_buffer_type_offload(model, layer_gpu);
+    //     }
+    //     // assign the output layer
+    //     if (n_gpu_layers > n_layer) {
+    //         int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(act_gpu_layers - 1)/act_gpu_layers) - splits.begin();
+    //         model.buft_output = llama_default_buffer_type_offload(model, layer_gpu);
+    //     } else {
+    //         model.buft_output = llama_default_buffer_type_cpu(true);
+    //     }
+    // }
 
-        // sum and normalize the splits to get the split points
-        float split_sum = 0.0f;
-        for (int i = 0; i < device_count; ++i) {
-            split_sum += splits[i];
-            splits[i] = split_sum;
-        }
-        for (int i = 0; i < device_count; ++i) {
-            splits[i] /= split_sum;
-        }
-
-        // assign the repeating layers to the devices according to the splits
-        int act_gpu_layers = std::min(n_gpu_layers, (int)n_layer + 1);
-        for (int i = i_gpu_start; i < n_layer; ++i) {
-            int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(i - i_gpu_start)/act_gpu_layers) - splits.begin();
-            model.buft_layer[i] = llama_default_buffer_type_offload(model, layer_gpu);
-        }
-        // assign the output layer
-        if (n_gpu_layers > n_layer) {
-            int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(act_gpu_layers - 1)/act_gpu_layers) - splits.begin();
-            model.buft_output = llama_default_buffer_type_offload(model, layer_gpu);
-        } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
-        }
+    // TODO 直接按行进行读取，split_buft是预先规划的缓冲区
+    ggml_backend_buffer_type_t split_buft;
+    if (split_mode == LLAMA_SPLIT_MODE_ROW) {
+        // TODO llama.cpp要求是多个GPU之间的，我们要做的是将张量在CPU和GPU之间的进行分配，打破单个GPU不能进行按行分配的限制
+        split_buft = llama_default_buffer_type_split(model, main_gpu, tensor_split);
     } else {
-        ggml_backend_buffer_type_t split_buft;
-        if (split_mode == LLAMA_SPLIT_MODE_ROW) {
-            split_buft = llama_default_buffer_type_split(model, main_gpu, tensor_split);
-        } else {
-            // LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_LAYER in backends where it is not supported
-            split_buft = llama_default_buffer_type_offload(model, main_gpu);
-        }
-        // assign the repeating layers
-        for (int i = i_gpu_start; i < n_layer; ++i) {
-            model.buft_layer[i] = {
-                split_buft,
-                llama_default_buffer_type_offload(model, main_gpu)
-            };
-        }
-        // assign the output layer
-        if (n_gpu_layers > n_layer) {
-            model.buft_output = {
-                split_buft,
-                llama_default_buffer_type_offload(model, main_gpu)
-            };
-        } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
-        }
+        // TODO 默认情况将模型全部加载到GPU进行处理
+        split_buft = llama_default_buffer_type_offload(model, main_gpu);
     }
+    // TODO 读入的过程中就需要进行内存空间占用率的判断，大于80%的时候就得进行模型清退
+    for (int i = 0; i < n_layer; ++i) {
+        model.buft_layer[i] = {
+            split_buft,
+            llama_default_buffer_type_offload(model, main_gpu)
+        };
+    }
+    // assign the output layer
+    // TODO 全部的输出层在GPU进行处理
+    model.buft_output = {
+        split_buft,
+        llama_default_buffer_type_offload(model, main_gpu)
+    };
 
     // count used buffer types
     std::map<ggml_backend_buffer_type_t, int> buft_layer_count;
@@ -8736,6 +8730,7 @@ static void llm_build_kv_store(
     cb(k_cache_view, "k_cache_view", il);
 
     // note: storing RoPE-ed version of K in the KV cache
+    // TODO 就是这里完成新的KV的存储
     ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur, k_cache_view));
 
     assert(v_cur->ne[0] == n_embd_v_gqa && v_cur->ne[1] == n_tokens);
@@ -9965,6 +9960,7 @@ struct llm_build_context {
         return lctx.inp_KQ_mask_cross;
     }
 
+    // TODO 在这个计算图中需要新开辟并行计算流程
     struct ggml_cgraph * build_llama() {
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
 
@@ -15269,7 +15265,7 @@ static struct ggml_cgraph * llama_build_graph(
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
-        // FIXME: fix in ggml_backend_sched
+        // TODO 考虑全部卸载到GPU然后进行并行运算的场景
         const bool full_offload = lctx.model.n_gpu_layers > (int)lctx.model.hparams.n_layer;
         if (batch.n_tokens < 32 || full_offload) {
             if (il != -1 && strcmp(name, "norm") == 0) {
@@ -15291,6 +15287,7 @@ static struct ggml_cgraph * llama_build_graph(
     llm.init();
 
     switch (model.arch) {
+        // 进行llama模型架构计算图的构造
         case LLM_ARCH_LLAMA:
             {
                 result = llm.build_llama();
@@ -16066,8 +16063,7 @@ static void llama_graph_compute(
 //
 static int llama_decode_internal(
          llama_context & lctx,
-           llama_batch   batch_all) { // TODO: rename back to batch
-
+           llama_batch   batch_all) { // TODO: rename back to bat
     lctx.is_encoding = false;
     const uint32_t n_tokens_all = batch_all.n_tokens;
 
@@ -16083,7 +16079,7 @@ static int llama_decode_internal(
         }
     }
 
-    const auto & model   = lctx.model;
+    const auto & model   = lctx.model; // 加载上下文中的模型
     const auto & hparams = model.hparams;
     const auto & cparams = lctx.cparams;
 
@@ -16098,7 +16094,7 @@ static int llama_decode_internal(
     }
     lctx.n_queued_tokens += n_tokens_all;
 
-    auto & kv_self = lctx.kv_self;
+    auto & kv_self = lctx.kv_self; // TODO 加载KV Cache,需要增加共享和多线程模块
 
     const int64_t n_embd  = hparams.n_embd;
     const int64_t n_vocab = hparams.n_vocab;
@@ -16202,7 +16198,10 @@ static int llama_decode_internal(
         ggml_backend_sched_reset(lctx.sched);
         ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 
+        // TODO 计算图也需要进行分支处理
         ggml_cgraph * gf = llama_build_graph(lctx, ubatch, false);
+        // 新的计算图
+        ggml_cgraph * new_gf = llama_build_graph(lctx, ubatch, false);
 
         // the output is always the last tensor in the graph
         struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
@@ -16232,7 +16231,16 @@ static int llama_decode_internal(
 
         llama_set_inputs(lctx, ubatch);
 
-        llama_graph_compute(lctx, gf, n_threads, threadpool);
+        // batch_all.all_pos_0 = 0,说明是prefill阶段
+        if (batch_all.all_pos_0 == 0) {
+            llama_graph_compute(lctx, gf, n_threads, threadpool);
+        } else {
+            // TODO 解码阶段需要修改原始的计算图，能够并行处理，否则将造成重复写入问题
+            std::thread origin(llama_graph_compute, lctx, gf, n_threads, threadpool);
+            std::thread new_thread(llama_graph_compute, lctx, new_gf, n_threads, threadpool);
+            origin.join();
+            new_thread.join();
+        }
 
         // update the kv ring buffer
         {

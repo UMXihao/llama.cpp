@@ -145,6 +145,7 @@ int main(int argc, char ** argv) {
 
     auto & sparams = params.sparams;
 
+    // TODO 是否屏蔽处理日志打印
 #ifndef LOG_DISABLE_LOGS
     log_set_target(log_filename_generator("main", "log"));
     LOG_TEE("Log start\n");
@@ -160,6 +161,7 @@ int main(int argc, char ** argv) {
     console::init(params.simple_io, params.use_color);
     atexit([]() { console::cleanup(); });
 
+    // TODO 是否输出全部的logits
     if (params.logits_all) {
         printf("\n************\n");
         printf("%s: please use the 'perplexity' tool for perplexity calculations\n", __func__);
@@ -194,7 +196,7 @@ int main(int argc, char ** argv) {
     LOG_TEE("%s: seed = %u\n", __func__, params.sparams.seed);
 
     LOG("%s: llama backend init\n", __func__);
-    llama_backend_init();
+    llama_backend_init(); // TODO 初始化计算空间
     llama_numa_init(params.numa);
 
     llama_model * model = nullptr;
@@ -296,6 +298,7 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // TODO 判断是否有开始标志，这个删除，减少对于模型的使用
     const bool add_bos = llama_add_bos_token(model);
     if (!llama_model_has_encoder(model)) {
         GGML_ASSERT(!llama_add_eos_token(model));
@@ -305,11 +308,13 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> embd_inp;
 
     {
+        // TODO 由于我们不使用对话模式，所以直接读取params.prompt，无需使用模型进行对话模式的解析
         auto prompt = (params.conversation && params.enable_chat_template && !params.prompt.empty())
             ? chat_add_and_format(model, chat_msgs, "system", params.prompt) // format the system prompt in conversation mode
             : params.prompt;
         if (params.interactive_first || !params.prompt.empty() || session_tokens.empty()) {
             LOG("tokenize the prompt\n");
+            // TODO 转化为llama_token向量
             embd_inp = ::llama_tokenize(ctx, prompt, true, true);
         } else {
             LOG("use session tokens\n");
@@ -321,7 +326,7 @@ int main(int argc, char ** argv) {
     }
 
     // Should not run without any tokens
-    if (embd_inp.empty()) {
+    if (embd_inp.empty()) { // TODO 直接判断输入不为空上报告警即可，无需太多处理，简化实现流程
         if (add_bos) {
             embd_inp.push_back(llama_token_bos(model));
             LOG("embd_inp was considered empty and bos was added: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
@@ -390,6 +395,7 @@ int main(int argc, char ** argv) {
         params.interactive = true;
     }
 
+    // TODO 是否回显输入的prompt，就是在输出模型生成的token之前将prompt再打印一遍
     if (params.verbose_prompt) {
         LOG_TEE("\n");
         LOG_TEE("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
@@ -422,46 +428,6 @@ int main(int argc, char ** argv) {
         };
         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
-    }
-
-    if (params.interactive) {
-        LOG_TEE("%s: interactive mode on.\n", __func__);
-
-        if (!params.antiprompt.empty()) {
-            for (const auto & antiprompt : params.antiprompt) {
-                LOG_TEE("Reverse prompt: '%s'\n", antiprompt.c_str());
-                if (params.verbose_prompt) {
-                    auto tmp = ::llama_tokenize(ctx, antiprompt, false, true);
-                    for (int i = 0; i < (int) tmp.size(); i++) {
-                        LOG_TEE("%6d -> '%s'\n", tmp[i], llama_token_to_piece(ctx, tmp[i]).c_str());
-                    }
-                }
-            }
-        }
-
-        if (params.input_prefix_bos) {
-            LOG_TEE("Input prefix with BOS\n");
-        }
-
-        if (!params.input_prefix.empty()) {
-            LOG_TEE("Input prefix: '%s'\n", params.input_prefix.c_str());
-            if (params.verbose_prompt) {
-                auto tmp = ::llama_tokenize(ctx, params.input_prefix, true, true);
-                for (int i = 0; i < (int) tmp.size(); i++) {
-                    LOG_TEE("%6d -> '%s'\n", tmp[i], llama_token_to_piece(ctx, tmp[i]).c_str());
-                }
-            }
-        }
-
-        if (!params.input_suffix.empty()) {
-            LOG_TEE("Input suffix: '%s'\n", params.input_suffix.c_str());
-            if (params.verbose_prompt) {
-                auto tmp = ::llama_tokenize(ctx, params.input_suffix, false, true);
-                for (int i = 0; i < (int) tmp.size(); i++) {
-                    LOG_TEE("%6d -> '%s'\n", tmp[i], llama_token_to_piece(ctx, tmp[i]).c_str());
-                }
-            }
-        }
     }
 
     smpl = gpt_sampler_init(model, sparams);
@@ -538,6 +504,7 @@ int main(int argc, char ** argv) {
         antiprompt_ids.emplace_back(::llama_tokenize(ctx, antiprompt, false, true));
     }
 
+    // TODO 因为llama2仅有解码器结构，所以这里需要扩展考虑其他厂家的模型
     if (llama_model_has_encoder(model)) {
         int enc_input_size = embd_inp.size();
         llama_token * enc_input_buf = embd_inp.data();
@@ -556,6 +523,10 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    // TODO 标志位，记录是否是第一次的prefill阶段，只有第二次解码的decode阶段才开启并发处理
+    bool flag = true;
+
+    // TODO 如果目标想要生成的token数量n_remain不等于零，就持续生成
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
@@ -706,6 +677,7 @@ int main(int argc, char ** argv) {
         } else {
             // some user input remains from prompt or interaction, forward it to processing
             LOG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
+            // TODO 将所有的输入token全部压入emdb中
             while ((int) embd_inp.size() > n_consumed) {
                 embd.push_back(embd_inp[n_consumed]);
 

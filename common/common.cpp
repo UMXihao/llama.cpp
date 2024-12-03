@@ -733,6 +733,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     } else if (!params.model_url.empty()) {
         model = llama_load_model_from_url(params.model_url.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
     } else {
+        // TODO 需要修改：加载模型，如何加载部分张量
         model = llama_load_model_from_file(params.model.c_str(), mparams);
     }
 
