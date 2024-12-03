@@ -6670,7 +6670,7 @@ static bool llm_load_tensors(
 
     // 直接按行进行读取，split buffer是预先规划的缓冲区
     ggml_backend_buffer_type_t split_buft;
-    LLAMA_LOG_INFO("%s: tensor_split = %.2f \n", __func__, tensor_split);
+    LLAMA_LOG_INFO("%s: tensor_split = %f \n", __func__, tensor_split[0]);
     if (split_mode == LLAMA_SPLIT_MODE_ROW) {
         // Allocate tensors between CPUs and GPUs
         split_buft = llama_default_buffer_type_split(model, main_gpu, tensor_split);
