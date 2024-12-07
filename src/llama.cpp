@@ -2291,6 +2291,8 @@ struct llama_hparams {
     uint32_t n_expert_shared = 0;
     float    expert_weights_scale = 0.0;
 
+    float tensor_split = 1.0;
+
     float f_norm_eps;
     float f_norm_rms_eps;
 
@@ -7001,6 +7003,8 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         LLAMA_LOG_INFO("begin to load model.\n");
         llama_model_loader ml(fname, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_split[0]);
 
+        model.hparams.tensor_split = params.tensor_split[0];
+
         model.hparams.vocab_only = params.vocab_only;
 
         try {
@@ -8429,14 +8433,14 @@ struct llm_build_context {
                 }
 
                 Qcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, rope_factors,
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, ceil(model.hparams.tensor_split * n_head), n_tokens), inp_pos, rope_factors,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
                 Kcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, rope_factors,
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, ceil(model.hparams.tensor_split * n_head_kv), n_tokens), inp_pos, rope_factors,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
