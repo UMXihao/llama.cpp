@@ -6998,21 +6998,25 @@ static bool llm_load_tensors(
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static int llama_model_load(const std::string & fname, llama_model & model, llama_model_params & params) {
     try {
+        LLAMA_LOG_INFO("begin to load model.\n");
         llama_model_loader ml(fname, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_split[0]);
 
         model.hparams.vocab_only = params.vocab_only;
 
         try {
+            LLAMA_LOG_INFO("begin to load model arch.\n");
             llm_load_arch(ml, model);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model architecture: " + std::string(e.what()));
         }
         try {
+            LLAMA_LOG_INFO("begin to load model hparam.\n");
             llm_load_hparams(ml, model);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
         try {
+            LLAMA_LOG_INFO("begin to load model vocab.\n");
             llm_load_vocab(ml, model);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
@@ -7046,7 +7050,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             params.n_gpu_layers = 0;
         }
 #endif
-
+        LLAMA_LOG_INFO("begin to load model tensor.\n");
         if (!llm_load_tensors(
             ml, model, params.n_gpu_layers, params.split_mode,  params.main_gpu, params.tensor_split, params.use_mlock,
             params.progress_callback, params.progress_callback_user_data

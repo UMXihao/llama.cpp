@@ -523,9 +523,6 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
-    // TODO 标志位，记录是否是第一次的prefill阶段，只有第二次解码的decode阶段才开启并发处理
-    bool flag = true;
-
     // TODO 如果目标想要生成的token数量n_remain不等于零，就持续生成
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict

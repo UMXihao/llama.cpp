@@ -4518,16 +4518,6 @@ const char * ggml_get_name(const struct ggml_tensor * tensor) {
     return tensor->name;
 }
 
-const char * ggml_get_tensor_name(const char * name) {
-    char tensor_name[GGML_MAX_NAME];
-    size_t i;
-    for (i = 0; i < sizeof(tensor_name) - 1 && name[i] != '\0'; i++) {
-        tensor_name[i] = name[i];
-    }
-    tensor_name[i] = '\0';
-    return tensor_name;
-}
-
 struct ggml_tensor * ggml_set_name(struct ggml_tensor * tensor, const char * name) {
     size_t i;
     for (i = 0; i < sizeof(tensor->name) - 1 && name[i] != '\0'; i++) {
@@ -22462,41 +22452,41 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
         // create the tensors
         for (uint64_t i = 0; i < ctx->header.n_tensors; ++i) {
             // TODO 解析名称，按照名称进行维度缩放
-            char * tensor_name = ggml_get_tensor_name(ctx->infos[i].name.data);
+            char * tensor_name = ctx->infos[i].name.data;
 
             if (strstr(tensor_name, "attn_q") != NULL && strstr(tensor_name, "weight")) {
                 // ne[1] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+                ctx->infos[i].ne[1] = ceilf(tensor_split * ctx->infos[i].ne[1]);
             } else if (strstr(tensor_name, "attn_k") != NULL && strstr(tensor_name, "weight")) {
                 // ne[1] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+                ctx->infos[i].ne[1] = ceilf(tensor_split * ctx->infos[i].ne[1]);
             } else if (strstr(tensor_name, "attn_v") != NULL && strstr(tensor_name, "weight")) {
                 // ne[1] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+                ctx->infos[i].ne[1] = ceilf(tensor_split * ctx->infos[i].ne[1]);
             } else if (strstr(tensor_name, "attn_output") != NULL && strstr(tensor_name, "weight")) {
                 // ne[0] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+                ctx->infos[i].ne[0] = ceilf(tensor_split * ctx->infos[i].ne[0]);
             } else if (strstr(tensor_name, "attn_k") != NULL && strstr(tensor_name, "bias")) {
                 // ne[0] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+                ctx->infos[i].ne[0] = ceilf(tensor_split * ctx->infos[i].ne[0]);
             } else if (strstr(tensor_name, "attn_v") != NULL && strstr(tensor_name, "bias")) {
                 // ne[0] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+                ctx->infos[i].ne[0] = ceilf(tensor_split * ctx->infos[i].ne[0]);
             } else if (strstr(tensor_name, "ffn_gate.") != NULL && strstr(tensor_name, "weight")) {
                 // ne[1] = [tensor_split * n_ff]
-                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+                ctx->infos[i].ne[1] = ceilf(tensor_split * ctx->infos[i].ne[1]);
             } else if (strstr(tensor_name, "fn_down") != NULL && strstr(tensor_name, "weight")) {
                 // ne[0] = [tensor_split * n_ff]
-                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+                ctx->infos[i].ne[0] = ceilf(tensor_split * ctx->infos[i].ne[0]);
             } else if (strstr(tensor_name, "ffn_up") != NULL && strstr(tensor_name, "weight")) {
                 // ne[1] = [tensor_split * n_ff]
-                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+                ctx->infos[i].ne[1] = ceilf(tensor_split * ctx->infos[i].ne[1]);
             } else if (strstr(tensor_name, "ffn_gate.") != NULL && strstr(tensor_name, "bias")) {
                 // ne[0] = [tensor_split * n_ff]
-                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+                ctx->infos[i].ne[0] = ceilf(tensor_split * ctx->infos[i].ne[0]);
             } else if (strstr(tensor_name, "ffn_up") != NULL && strstr(tensor_name, "bias")) {
                 // ne[0] = [tensor_split * n_ff]
-                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+                ctx->infos[i].ne[0] = ceilf(tensor_split * ctx->infos[i].ne[0]);
             }
 
             const int64_t ne[GGML_MAX_DIMS] = {
