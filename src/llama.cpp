@@ -2426,13 +2426,13 @@ struct llama_hparams {
     uint32_t n_embd_k_gqa(uint32_t il = 0) const { // dimension of key embeddings across all k-v heads
         const uint32_t n_head_kv = this->n_head_kv(il);
 
-        return n_embd_head_k * n_head_kv;
+        return n_embd_head_k * ceil(n_head_kv * tensor_split);
     }
 
     uint32_t n_embd_v_gqa(uint32_t il = 0) const { // dimension of value embeddings across all k-v heads
         const uint32_t n_head_kv = this->n_head_kv(il);
 
-        return n_embd_head_v * n_head_kv;
+        return n_embd_head_v * ceil(n_head_kv * tensor_split);
     }
 
     uint32_t n_embd_k_s() const { // dimension of the rolling state embeddings
