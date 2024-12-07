@@ -1193,7 +1193,7 @@ struct llama_model * llama_load_model_from_url(
             /*.no_alloc = */ true,
             /*.ctx      = */ NULL,
         };
-        auto * ctx_gguf = gguf_init_from_file(path_model, gguf_params);
+        auto * ctx_gguf = gguf_init_from_file(path_model, gguf_params, 1);
         if (!ctx_gguf) {
             fprintf(stderr, "\n%s:  failed to load input GGUF from %s\n", __func__, path_model);
             return NULL;
@@ -1618,7 +1618,7 @@ static llama_control_vector_data llama_control_vector_load_one(const llama_contr
         /* .no_alloc = */ false,
         /* .ctx      = */ &ctx,
     };
-    struct gguf_context * ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), meta_gguf_params);
+    struct gguf_context * ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), meta_gguf_params, 1);
     if (!ctx_gguf) {
         fprintf(stderr, "%s: failed to load control vector file from %s\n", __func__, load_info.fname.c_str());
         return result;

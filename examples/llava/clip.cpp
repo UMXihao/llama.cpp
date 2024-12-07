@@ -1032,7 +1032,7 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         /*.ctx      = */ &meta,
     };
 
-    struct gguf_context * ctx = gguf_init_from_file(fname, params);
+    struct gguf_context * ctx = gguf_init_from_file(fname, params, 1);
     if (!ctx) {
         throw std::runtime_error(format("%s: failed to load CLIP model from %s. Does this file exist?\n", __func__, fname));
     }

@@ -50,7 +50,7 @@ static struct gguf_context * load_gguf(std::string & fname, struct ggml_context 
         /*.no_alloc = */ true,
         /*.ctx      = */ ctx_ggml,
     };
-    struct gguf_context * ctx_gguf = gguf_init_from_file(fname.c_str(), params);
+    struct gguf_context * ctx_gguf = gguf_init_from_file(fname.c_str(), params, 1);
     if (!ctx_gguf) {
         throw std::runtime_error("failed to load input GGUF from " + fname);
     }

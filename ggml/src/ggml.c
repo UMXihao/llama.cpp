@@ -3892,6 +3892,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         view_src   = view_src->view_src;
     }
 
+    // TODO 内存空间优化点
     size_t data_size = ggml_row_size(type, ne[0]);
     for (int i = 1; i < n_dims; i++) {
         data_size *= ne[i];
@@ -4515,6 +4516,16 @@ GGML_CALL enum ggml_unary_op ggml_get_unary_op(const struct ggml_tensor * tensor
 
 const char * ggml_get_name(const struct ggml_tensor * tensor) {
     return tensor->name;
+}
+
+const char * ggml_get_name(const char * name) {
+    char tensor_name[GGML_MAX_NAME];
+    size_t i;
+    for (i = 0; i < sizeof(tensor_name) - 1 && name[i] != '\0'; i++) {
+        tensor_name[i] = name[i];
+    }
+    tensor_name[i] = '\0';
+    return tensor_name;
 }
 
 struct ggml_tensor * ggml_set_name(struct ggml_tensor * tensor, const char * name) {
@@ -22147,7 +22158,7 @@ struct gguf_context * gguf_init_empty(void) {
     return ctx;
 }
 
-struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params) {
+struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params, float tensor_split) {
     FILE * file = ggml_fopen(fname, "rb");
     if (!file) {
         fprintf(stderr, "%s: failed to open '%s': '%s'\n", __func__, fname, strerror(errno));
@@ -22450,13 +22461,50 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
         // create the tensors
         for (uint64_t i = 0; i < ctx->header.n_tensors; ++i) {
+            // TODO 解析名称，按照名称进行维度缩放
+            char * tensor_name = ggml_get_name(ctx->infos[i].name.data);
+
+            if (strstr(tensor_name, "attn_q") != NULL && strstr(tensor_name, "weight")) {
+                // ne[1] = n_embd/n_head * [tensor_split * n_head]
+                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+            } else if (strstr(tensor_name, "attn_k") != NULL && strstr(tensor_name, "weight")) {
+                // ne[1] = n_embd/n_head * [tensor_split * n_head]
+                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+            } else if (strstr(tensor_name, "attn_v") != NULL && strstr(tensor_name, "weight")) {
+                // ne[1] = n_embd/n_head * [tensor_split * n_head]
+                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+            } else if (strstr(tensor_name, "attn_output") != NULL && strstr(tensor_name, "weight")) {
+                // ne[0] = n_embd/n_head * [tensor_split * n_head]
+                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+            } else if (strstr(tensor_name, "attn_k") != NULL && strstr(tensor_name, "bias")) {
+                // ne[0] = n_embd/n_head * [tensor_split * n_head]
+                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+            } else if (strstr(tensor_name, "attn_v") != NULL && strstr(tensor_name, "bias")) {
+                // ne[0] = n_embd/n_head * [tensor_split * n_head]
+                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+            } else if (strstr(tensor_name, "ffn_gate.") != NULL && strstr(tensor_name, "weight")) {
+                // ne[1] = [tensor_split * n_ff]
+                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+            } else if (strstr(tensor_name, "fn_down") != NULL && strstr(tensor_name, "weight")) {
+                // ne[0] = [tensor_split * n_ff]
+                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+            } else if (strstr(tensor_name, "ffn_up") != NULL && strstr(tensor_name, "weight")) {
+                // ne[1] = [tensor_split * n_ff]
+                ctx->infos[i].ne[1] = ceil(tensor_split * ctx->infos[i].ne[1]);
+            } else if (strstr(tensor_name, "ffn_gate.") != NULL && strstr(tensor_name, "bias")) {
+                // ne[0] = [tensor_split * n_ff]
+                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+            } else if (strstr(tensor_name, "ffn_up") != NULL && strstr(tensor_name, "bias")) {
+                // ne[0] = [tensor_split * n_ff]
+                ctx->infos[i].ne[0] = ceil(tensor_split * ctx->infos[i].ne[0]);
+            }
+
             const int64_t ne[GGML_MAX_DIMS] = {
                 ctx->infos[i].ne[0],
                 ctx->infos[i].ne[1],
                 ctx->infos[i].ne[2],
                 ctx->infos[i].ne[3],
             };
-
             struct ggml_tensor * cur = ggml_new_tensor(ctx_data, ctx->infos[i].type, ctx->infos[i].n_dims, ne);
 
             ok = ok && cur != NULL;
@@ -22466,6 +22514,8 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
             }
 
             ggml_set_name(cur, ctx->infos[i].name.data);
+
+            //
 
             // point the data member to the appropriate location in the binary blob using the tensor infos
             if (!params.no_alloc) {

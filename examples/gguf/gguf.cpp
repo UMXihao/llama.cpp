@@ -90,7 +90,7 @@ static bool gguf_ex_read_0(const std::string & fname) {
         /*.ctx      = */ NULL,
     };
 
-    struct gguf_context * ctx = gguf_init_from_file(fname.c_str(), params);
+    struct gguf_context * ctx = gguf_init_from_file(fname.c_str(), params, 1);
 
     if (!ctx) {
         fprintf(stderr, "%s: failed to load '%s'\n", __func__, fname.c_str());
@@ -155,7 +155,7 @@ static bool gguf_ex_read_1(const std::string & fname, bool check_data) {
         /*.ctx      = */ &ctx_data,
     };
 
-    struct gguf_context * ctx = gguf_init_from_file(fname.c_str(), params);
+    struct gguf_context * ctx = gguf_init_from_file(fname.c_str(), params, 1);
 
     printf("%s: version:      %d\n", __func__, gguf_get_version(ctx));
     printf("%s: alignment:   %zu\n", __func__, gguf_get_alignment(ctx));

@@ -358,7 +358,7 @@ static void gguf_split(const split_params & split_params) {
         exit(EXIT_FAILURE);
     }
 
-    auto * ctx_gguf = gguf_init_from_file(split_params.input.c_str(), params);
+    auto * ctx_gguf = gguf_init_from_file(split_params.input.c_str(), params, 1);
     if (!ctx_gguf) {
         fprintf(stderr, "%s:  failed to load input GGUF from %s\n", __func__, split_params.input.c_str());
         exit(EXIT_FAILURE);
@@ -415,7 +415,7 @@ static void gguf_merge(const split_params & split_params) {
         }
         fprintf(stderr, "%s: reading metadata %s ...", __func__, split_path);
 
-        auto * ctx_gguf = gguf_init_from_file(split_path, params);
+        auto * ctx_gguf = gguf_init_from_file(split_path, params, 1);
         if (!ctx_gguf) {
             fprintf(stderr, "\n%s:  failed to load input GGUF from %s\n", __func__, split_params.input.c_str());
             exit(EXIT_FAILURE);
