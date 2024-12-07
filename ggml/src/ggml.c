@@ -4518,7 +4518,7 @@ const char * ggml_get_name(const struct ggml_tensor * tensor) {
     return tensor->name;
 }
 
-const char * ggml_get_name(const char * name) {
+const char * ggml_get_tensor_name(const char * name) {
     char tensor_name[GGML_MAX_NAME];
     size_t i;
     for (i = 0; i < sizeof(tensor_name) - 1 && name[i] != '\0'; i++) {
@@ -22462,7 +22462,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
         // create the tensors
         for (uint64_t i = 0; i < ctx->header.n_tensors; ++i) {
             // TODO 解析名称，按照名称进行维度缩放
-            char * tensor_name = ggml_get_name(ctx->infos[i].name.data);
+            char * tensor_name = ggml_get_tensor_name(ctx->infos[i].name.data);
 
             if (strstr(tensor_name, "attn_q") != NULL && strstr(tensor_name, "weight")) {
                 // ne[1] = n_embd/n_head * [tensor_split * n_head]
