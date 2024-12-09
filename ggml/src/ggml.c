@@ -22456,22 +22456,22 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
 
             if (strstr(tensor_name, "attn_q") != NULL && strstr(tensor_name, "weight") != NULL) {
                 // ne[1] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[1] = ceilf(tensor_split * ctx->infos[i].ne[1]);
+                ctx->infos[i].ne[1] = ctx->infos[i].ne[1] / 32 * ceilf(tensor_split * 32);
             } else if (strstr(tensor_name, "attn_k") != NULL && strstr(tensor_name, "weight") != NULL) {
                 // ne[1] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[1] = ceilf(tensor_split * ctx->infos[i].ne[1]);
+                ctx->infos[i].ne[1] = ctx->infos[i].ne[1] / 32 * ceilf(tensor_split * 32);
             } else if (strstr(tensor_name, "attn_v") != NULL && strstr(tensor_name, "weight") != NULL) {
                 // ne[1] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[1] = ceilf(tensor_split * ctx->infos[i].ne[1]);
+                ctx->infos[i].ne[1] = ctx->infos[i].ne[1] / 32 * ceilf(tensor_split * 32);
             } else if (strstr(tensor_name, "attn_output") != NULL && strstr(tensor_name, "weight") != NULL) {
                 // ne[0] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[0] = ceilf(tensor_split * ctx->infos[i].ne[0]);
+                ctx->infos[i].ne[0] = ctx->infos[i].ne[0] / 32 * ceilf(tensor_split * 32);
             } else if (strstr(tensor_name, "attn_k") != NULL && strstr(tensor_name, "bias") != NULL) {
                 // ne[0] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[0] = ceilf(tensor_split * ctx->infos[i].ne[0]);
+                ctx->infos[i].ne[0] = ctx->infos[i].ne[0] / 32 * ceilf(tensor_split * 32);
             } else if (strstr(tensor_name, "attn_v") != NULL && strstr(tensor_name, "bias") != NULL) {
                 // ne[0] = n_embd/n_head * [tensor_split * n_head]
-                ctx->infos[i].ne[0] = ceilf(tensor_split * ctx->infos[i].ne[0]);
+                ctx->infos[i].ne[0] = ctx->infos[i].ne[0] / 32 * ceilf(tensor_split * 32);
             } else if (strstr(tensor_name, "ffn_gate.") != NULL && strstr(tensor_name, "weight") != NULL) {
                 // ne[1] = [tensor_split * n_ff]
                 ctx->infos[i].ne[1] = ceilf(tensor_split * ctx->infos[i].ne[1]);
