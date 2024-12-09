@@ -4613,7 +4613,7 @@ static struct ggml_tensor * ggml_dup_impl(
     if (!inplace && (a->grad)) {
         is_node = true;
     }
-
+    // TODO view ctx和a的ne乘积必须相同
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
     result->op   = GGML_OP_DUP;

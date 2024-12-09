@@ -145,7 +145,7 @@ int main(int argc, char ** argv) {
 
     auto & sparams = params.sparams;
 
-    // TODO 是否屏蔽处理日志打印
+    // 是否屏蔽处理日志打印
 #ifndef LOG_DISABLE_LOGS
     log_set_target(log_filename_generator("main", "log"));
     LOG_TEE("Log start\n");
@@ -153,15 +153,12 @@ int main(int argc, char ** argv) {
     llama_log_set(llama_log_callback_logTee, nullptr);
 #endif // LOG_DISABLE_LOGS
 
-    // TODO: Dump params ?
-    //LOG("Params perplexity: %s\n", LOG_TOSTR(params.perplexity));
-
     // save choice to use color for later
     // (note for later: this is a slightly awkward choice)
     console::init(params.simple_io, params.use_color);
     atexit([]() { console::cleanup(); });
 
-    // TODO 是否输出全部的logits
+    // 是否输出全部的logits
     if (params.logits_all) {
         printf("\n************\n");
         printf("%s: please use the 'perplexity' tool for perplexity calculations\n", __func__);
@@ -196,7 +193,7 @@ int main(int argc, char ** argv) {
     LOG_TEE("%s: seed = %u\n", __func__, params.sparams.seed);
 
     LOG("%s: llama backend init\n", __func__);
-    llama_backend_init(); // TODO 初始化计算空间
+    llama_backend_init();
     llama_numa_init(params.numa);
 
     llama_model * model = nullptr;
@@ -211,7 +208,7 @@ int main(int argc, char ** argv) {
 
     // load the model and apply lora adapter, if any
     LOG("%s: load the model and apply lora adapter, if any\n", __func__);
-    llama_init_result llama_init = llama_init_from_gpt_params(params);
+    llama_init_result llama_init = llama_init_from_gpt_params(params); // 加载模型！
 
     model = llama_init.model;
     ctx = llama_init.context;
@@ -261,44 +258,13 @@ int main(int argc, char ** argv) {
                 __func__, n_ctx_train, n_ctx);
     }
 
-    // print chat template example in conversation mode
-    if (params.conversation) {
-        if (params.enable_chat_template) {
-            LOG_TEE("%s: chat template example: %s\n", __func__, llama_chat_format_example(model, params.chat_template).c_str());
-        } else {
-            LOG_TEE("%s: in-suffix/prefix is specified, chat template will be disabled\n", __func__);
-        }
-    }
-
     // print system information
     {
         LOG_TEE("\n");
         LOG_TEE("%s\n", gpt_params_get_system_info(params).c_str());
     }
 
-    std::string path_session = params.path_prompt_cache;
-    std::vector<llama_token> session_tokens;
-
-    if (!path_session.empty()) {
-        LOG_TEE("%s: attempting to load saved session from '%s'\n", __func__, path_session.c_str());
-        if (!file_exists(path_session)) {
-            LOG_TEE("%s: session file does not exist, will create.\n", __func__);
-        } else if (file_is_empty(path_session)) {
-            LOG_TEE("%s: The session file is empty. A new session will be initialized.\n", __func__);
-        } else {
-            // The file exists and is not empty
-            session_tokens.resize(n_ctx);
-            size_t n_token_count_out = 0;
-            if (!llama_state_load_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
-                LOG_TEE("%s: error: failed to load session file '%s'\n", __func__, path_session.c_str());
-                return 1;
-            }
-            session_tokens.resize(n_token_count_out);
-            LOG_TEE("%s: loaded a session with prompt size of %d tokens\n", __func__, (int)session_tokens.size());
-        }
-    }
-
-    // TODO 判断是否有开始标志，这个删除，减少对于模型的使用
+    // 判断是否有开始标志
     const bool add_bos = llama_add_bos_token(model);
     if (!llama_model_has_encoder(model)) {
         GGML_ASSERT(!llama_add_eos_token(model));
@@ -308,17 +274,12 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> embd_inp;
 
     {
-        // TODO 由于我们不使用对话模式，所以直接读取params.prompt，无需使用模型进行对话模式的解析
-        auto prompt = (params.conversation && params.enable_chat_template && !params.prompt.empty())
-            ? chat_add_and_format(model, chat_msgs, "system", params.prompt) // format the system prompt in conversation mode
-            : params.prompt;
-        if (params.interactive_first || !params.prompt.empty() || session_tokens.empty()) {
+        // 由于我们不使用对话模式，所以直接读取params.prompt，无需使用模型进行对话模式的解析
+        auto prompt = params.prompt;
+        if (params.interactive_first || !params.prompt.empty()) {
             LOG("tokenize the prompt\n");
-            // TODO 转化为llama_token向量
+            // 转化为llama_token向量
             embd_inp = ::llama_tokenize(ctx, prompt, true, true);
-        } else {
-            LOG("use session tokens\n");
-            embd_inp = session_tokens;
         }
 
         LOG("prompt: \"%s\"\n", log_tostr(prompt));
@@ -326,57 +287,15 @@ int main(int argc, char ** argv) {
     }
 
     // Should not run without any tokens
-    if (embd_inp.empty()) { // TODO 直接判断输入不为空上报告警即可，无需太多处理，简化实现流程
-        if (add_bos) {
-            embd_inp.push_back(llama_token_bos(model));
-            LOG("embd_inp was considered empty and bos was added: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
-        } else {
-            LOG_TEE("error: input is empty\n");
-            return -1;
-        }
+    if (embd_inp.empty()) { // 直接判断输入不为空上报告警即可，无需太多处理，简化实现流程
+        LOG_TEE("error: input is empty\n");
+        return -1;
     }
 
     // Tokenize negative prompt
     if ((int) embd_inp.size() > n_ctx - 4) {
         LOG_TEE("%s: error: prompt is too long (%d tokens, max %d)\n", __func__, (int) embd_inp.size(), n_ctx - 4);
         return 1;
-    }
-
-    // debug message about similarity of saved session, if applicable
-    size_t n_matching_session_tokens = 0;
-    if (!session_tokens.empty()) {
-        for (llama_token id : session_tokens) {
-            if (n_matching_session_tokens >= embd_inp.size() || id != embd_inp[n_matching_session_tokens]) {
-                break;
-            }
-            n_matching_session_tokens++;
-        }
-        if (params.prompt.empty() && n_matching_session_tokens == embd_inp.size()) {
-            LOG_TEE("%s: using full prompt from session file\n", __func__);
-        } else if (n_matching_session_tokens >= embd_inp.size()) {
-            LOG_TEE("%s: session file has exact match for prompt!\n", __func__);
-        } else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
-            LOG_TEE("%s: warning: session file has low similarity to prompt (%zu / %zu tokens); will mostly be reevaluated\n",
-                __func__, n_matching_session_tokens, embd_inp.size());
-        } else {
-            LOG_TEE("%s: session file matches %zu / %zu tokens of prompt\n",
-                __func__, n_matching_session_tokens, embd_inp.size());
-        }
-
-        // remove any "future" tokens that we might have inherited from the previous session
-        llama_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
-    }
-
-    LOGLN(
-            "recalculate the cached logits (check): embd_inp.empty() %s, n_matching_session_tokens %zu, embd_inp.size() %zu, session_tokens.size() %zu",
-            log_tostr(embd_inp.empty()), n_matching_session_tokens, embd_inp.size(), session_tokens.size());
-
-    // if we will use the cache for the full prompt without reaching the end of the cache, force
-    // reevaluation of the last token to recalculate the cached logits
-    if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() && session_tokens.size() > embd_inp.size()) {
-        LOGLN("recalculate the cached logits (do): session_tokens.resize( %zu )", embd_inp.size() - 1);
-
-        session_tokens.resize(embd_inp.size() - 1);
     }
 
     // number of tokens to keep when resetting context
@@ -395,7 +314,7 @@ int main(int argc, char ** argv) {
         params.interactive = true;
     }
 
-    // TODO 是否回显输入的prompt，就是在输出模型生成的token之前将prompt再打印一遍
+    // 是否回显输入的prompt，就是在输出模型生成的token之前将prompt再打印一遍
     if (params.verbose_prompt) {
         LOG_TEE("\n");
         LOG_TEE("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
@@ -456,29 +375,9 @@ int main(int argc, char ** argv) {
     }
     LOG_TEE("\n\n");
 
-    if (params.interactive) {
-        const char * control_message;
-        if (params.multiline_input) {
-            control_message = " - To return control to the AI, end your input with '\\'.\n"
-                              " - To return control without starting a new line, end your input with '/'.\n";
-        } else {
-            control_message = " - Press Return to return control to the AI.\n"
-                              " - To return control without starting a new line, end your input with '/'.\n"
-                              " - If you want to submit another line, end your input with '\\'.\n";
-        }
-        LOG_TEE("== Running in interactive mode. ==\n");
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
-        LOG_TEE(       " - Press Ctrl+C to interject at any time.\n");
-#endif
-        LOG_TEE(       "%s\n", control_message);
-
-        is_interacting = params.interactive_first;
-    }
-
     bool is_antiprompt        = false;
     bool input_echo           = true;
     bool display              = true;
-    bool need_to_save_session = !path_session.empty() && n_matching_session_tokens < embd_inp.size();
 
     int n_past             = 0;
     int n_remain           = params.n_predict;
@@ -504,7 +403,7 @@ int main(int argc, char ** argv) {
         antiprompt_ids.emplace_back(::llama_tokenize(ctx, antiprompt, false, true));
     }
 
-    // TODO 因为llama2仅有解码器结构，所以这里需要扩展考虑其他厂家的模型
+    // 因为llama2仅有解码器结构，所以这里需要扩展考虑其他厂家的模型
     if (llama_model_has_encoder(model)) {
         int enc_input_size = embd_inp.size();
         llama_token * enc_input_buf = embd_inp.data();
@@ -523,7 +422,7 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
-    // TODO 如果目标想要生成的token数量n_remain不等于零，就持续生成
+    // 如果目标想要生成的token数量n_remain不等于零，就持续生成
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
@@ -567,9 +466,6 @@ int main(int argc, char ** argv) {
                     LOG("after swap: n_past = %d\n", n_past);
 
                     LOG("embd: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
-
-                    LOG("clear session path\n");
-                    path_session.clear();
                 }
             } else {
                 // context extension via Self-Extend
@@ -595,28 +491,6 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            // try to reuse a matching prefix from the loaded session instead of re-eval (via n_past)
-            if (n_session_consumed < (int) session_tokens.size()) {
-                size_t i = 0;
-                for ( ; i < embd.size(); i++) {
-                    if (embd[i] != session_tokens[n_session_consumed]) {
-                        session_tokens.resize(n_session_consumed);
-                        break;
-                    }
-
-                    n_past++;
-                    n_session_consumed++;
-
-                    if (n_session_consumed >= (int) session_tokens.size()) {
-                        ++i;
-                        break;
-                    }
-                }
-                if (i > 0) {
-                    embd.erase(embd.begin(), embd.begin() + i);
-                }
-            }
-
             for (int i = 0; i < (int) embd.size(); i += params.n_batch) {
                 int n_eval = (int) embd.size() - i;
                 if (n_eval > params.n_batch) {
@@ -638,24 +512,11 @@ int main(int argc, char ** argv) {
                     LOG_TEE("\n\033[31mTokens consumed so far = %d / %d \033[0m\n", n_past, n_ctx);
                 }
             }
-
-            if (!embd.empty() && !path_session.empty()) {
-                session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
-                n_session_consumed = session_tokens.size();
-            }
         }
 
         embd.clear();
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
-            // optionally save the session on first sample (for faster prompt loading next time)
-            if (!path_session.empty() && need_to_save_session && !params.prompt_cache_ro) {
-                need_to_save_session = false;
-                llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
-
-                LOG("saved session to %s\n", path_session.c_str());
-            }
-
             const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
 
             gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
@@ -674,7 +535,7 @@ int main(int argc, char ** argv) {
         } else {
             // some user input remains from prompt or interaction, forward it to processing
             LOG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
-            // TODO 将所有的输入token全部压入emdb中
+            // 将所有的输入token全部压入emdb中
             while ((int) embd_inp.size() > n_consumed) {
                 embd.push_back(embd_inp[n_consumed]);
 
@@ -897,11 +758,6 @@ int main(int argc, char ** argv) {
             n_remain = params.n_predict;
             is_interacting = true;
         }
-    }
-
-    if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
-        LOG_TEE("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
-        llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
     }
 
     LOG_TEE("\n");

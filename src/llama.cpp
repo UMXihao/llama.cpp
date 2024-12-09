@@ -7498,7 +7498,7 @@ static struct ggml_tensor * llm_build_kqv(
 
     const int64_t n_ctx         = cparams.n_ctx;
     const int64_t n_head        = hparams.n_head(il);
-    const int64_t n_head_kv     = hparams.n_head_kv(il);
+    const int64_t n_head_kv     = ceil(hparams.tensor_split * hparams.n_head_kv(il));
     const int64_t n_embd_head_k = hparams.n_embd_head_k;
     const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(il);
     const int64_t n_embd_head_v = hparams.n_embd_head_v;
@@ -7537,7 +7537,7 @@ static struct ggml_tensor * llm_build_kqv(
             ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
         }
 
-        cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
+        cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*ceil(n_head*hparams.tensor_split), n_tokens);
     } else {
         struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
         cb(kq, "kq", il);
@@ -7588,7 +7588,7 @@ static struct ggml_tensor * llm_build_kqv(
         struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
         cb(kqv_merged, "kqv_merged", il);
 
-        cur = ggml_cont_2d(ctx, kqv_merged, n_embd_head_v*n_head, n_tokens);
+        cur = ggml_cont_2d(ctx, kqv_merged, n_embd_head_v*ceil(n_head*hparams.tensor_split), n_tokens);
         cb(cur, "kqv_merged_cont", il);
     }
 
