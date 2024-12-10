@@ -3197,7 +3197,11 @@ struct llama_context {
 
     struct llama_cparams        cparams;
     struct llama_sbatch         sbatch;
-    struct llama_kv_cache       kv_self;
+    struct llama_sbatch         new_sbatch; // new thread
+
+    struct llama_kv_cache       kv_self; // share KV - first token
+    struct llama_kv_cache       kv_origin; // origin KV
+    struct llama_kv_cache       kv_new_thread; // new thread KV
     struct llama_control_vector cvec;
 
     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
@@ -3228,11 +3232,12 @@ struct llama_context {
     mutable int32_t n_eval   = 0; // number of eval calls
 
     // host buffer for the model output (logits and embeddings)
-    ggml_backend_buffer_t buf_output = nullptr;
+    ggml_backend_buffer_t buf_output = nullptr; // TODO 待验证
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     size_t  logits_size = 0; // capacity (of floats) for logits
     float * logits      = nullptr;
+    float * new_logits      = nullptr; // new thread
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
     size_t  output_size = 0; // capacity (of tokens positions) for the output buffers
@@ -3244,10 +3249,12 @@ struct llama_context {
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     size_t  embd_size = 0; // capacity (of floats) for embeddings
     float * embd      = nullptr;
+    float * new_embd      = nullptr; // new thread，主要目的就是获取该值
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
+    std::map<llama_seq_id, std::vector<float>> new_embd_seq; // new thread
 
     // whether we are computing encoder output or decoder output
     bool is_encoding = false;
@@ -6912,7 +6919,6 @@ static bool llm_load_tensors(
         }
 #endif
         else {
-            // TODO buft全部由GPU处理，内存大小规划就是这个地方
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
             if (buf == nullptr) {
                 throw std::runtime_error("unable to allocate backend buffer");
@@ -14336,6 +14342,7 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
         lctx.output_ids.resize(n_batch);
     }
 
+    // TODO 输出缓冲区，需要准备两个
     const size_t prev_size = lctx.buf_output ? ggml_backend_buffer_get_size(lctx.buf_output) : 0;
     const size_t new_size  = (logits_size + embd_size) * sizeof(float);
 
@@ -14351,6 +14358,8 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
             lctx.buf_output = nullptr;
             lctx.logits = nullptr;
             lctx.embd = nullptr;
+            lctx.new_logits = nullptr;
+            lctx.new_embd = nullptr;
         }
 
         lctx.buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), new_size);
@@ -14364,6 +14373,8 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 
     lctx.logits = has_logits ? output_base               : nullptr;
     lctx.embd   = has_embd   ? output_base + logits_size : nullptr;
+    lctx.new_logits = has_logits ? output_base               : nullptr;
+    lctx.new_embd   = has_embd   ? output_base + logits_size : nullptr;
 
     lctx.output_size = n_outputs_max;
     lctx.logits_size = logits_size;
@@ -14456,8 +14467,8 @@ static void llama_graph_compute(
 static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch_all) { // TODO: rename back to bat
-    lctx.is_encoding = false;
-    const uint32_t n_tokens_all = batch_all.n_tokens;
+    lctx.is_encoding = false; // 是否是编码模式
+    const uint32_t n_tokens_all = batch_all.n_tokens; // 输入token的数量，decode阶段为1
 
     if (n_tokens_all == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0", __func__);
@@ -14472,8 +14483,8 @@ static int llama_decode_internal(
     }
 
     const auto & model   = lctx.model; // 加载上下文中的模型
-    const auto & hparams = model.hparams;
-    const auto & cparams = lctx.cparams;
+    const auto & hparams = model.hparams; // 模型超参数
+    const auto & cparams = lctx.cparams; // 上下文参数
 
     GGML_ASSERT((!batch_all.token && batch_all.embd) || (batch_all.token && !batch_all.embd)); // NOLINT
 
@@ -14484,22 +14495,24 @@ static int llama_decode_internal(
     if (lctx.t_compute_start_us == 0) {
         lctx.t_compute_start_us = ggml_time_us();
     }
-    lctx.n_queued_tokens += n_tokens_all;
+    lctx.n_queued_tokens += n_tokens_all; // TODO 解码阶段队列中的数量加1，如果这个地方使用相同的上下文就会造成冲突
 
-    auto & kv_self = lctx.kv_self; // TODO 加载KV Cache,需要增加共享和多线程模块
+    auto & kv_self = lctx.kv_self; // TODO 加载KV Cache,需要增加共享和多线程模块,新生成的KV Cache需要进行类型判断
 
-    const int64_t n_embd  = hparams.n_embd;
-    const int64_t n_vocab = hparams.n_vocab;
+    const int64_t n_embd  = hparams.n_embd; // 词嵌入的维度 4096
+    const int64_t n_vocab = hparams.n_vocab; // 词汇表的数量
 
-    uint32_t n_outputs = 0;
+    uint32_t n_outputs = 0; // 输出长度
     uint32_t n_outputs_prev = 0;
 
     const auto n_ubatch = cparams.n_ubatch;
 
+    // TODO 我们需要词嵌入信息，用以计算输出之间的一致性，主要是需要词向量，不是logit
     // this indicates we are doing pooled embedding, so we ignore batch.logits and output all tokens
     const bool embd_pooled = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
 
     lctx.embd_seq.clear();
+    lctx.new_embd_seq.clear();
 
     // count outputs
     if (batch_all.logits && !embd_pooled) {
@@ -14513,9 +14526,16 @@ static int llama_decode_internal(
         n_outputs = 1;
     }
 
-    lctx.sbatch.from_batch(batch_all, n_embd,
+    // 类型判断，完成sequence-batch转换
+    if (batch_all.type == 0) {
+        lctx.sbatch.from_batch(batch_all, n_embd,
         /* simple_split */ !kv_self.recurrent,
         /* logits_all   */ n_outputs == n_tokens_all);
+    } else {
+        lctx.new_sbatch.from_batch(batch_all, n_embd,
+        /* simple_split */ !kv_self.recurrent,
+        /* logits_all   */ n_outputs == n_tokens_all);
+    }
 
     // reserve output buffer
     if (llama_output_reserve(lctx, n_outputs) < n_outputs) {
@@ -14528,14 +14548,27 @@ static int llama_decode_internal(
         if (kv_self.recurrent) {
             if (embd_pooled) {
                 // Pooled embeddings cannot be split across ubatches (yet)
-                ubatch = lctx.sbatch.split_seq(n_ubatch);
+                if (batch_all.type == 0) {
+                    ubatch = lctx.sbatch.split_seq(n_ubatch);
+                } else {
+                    ubatch = lctx.new_sbatch.split_seq(n_ubatch);
+                }
+
             } else {
                 // recurrent model architectures are easier to implement
                 // with equal-length sequences
-                ubatch = lctx.sbatch.split_equal(n_ubatch);
+                if (batch_all.type == 0) {
+                    ubatch = lctx.sbatch.split_equal(n_ubatch);
+                } else {
+                    ubatch = lctx.new_sbatch.split_equal(n_ubatch);
+                }
             }
         } else {
-            ubatch = lctx.sbatch.split_simple(n_ubatch);
+            if (batch_all.type == 0) {
+                ubatch = lctx.sbatch.split_simple(n_ubatch);
+            } else {
+                ubatch = lctx.new_sbatch.split_simple(n_ubatch);
+            }
         }
         const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -14639,7 +14672,7 @@ static int llama_decode_internal(
         //}
 
         // extract logits
-        if (res) {
+        if (res && batch_all.type == 0) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(lctx.logits != nullptr);
@@ -14654,8 +14687,24 @@ static int llama_decode_internal(
             }
         }
 
+        // extract logits
+        if (res && batch_all.type == 1) {
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
+            GGML_ASSERT(backend_res != nullptr);
+            GGML_ASSERT(lctx.new_logits != nullptr);
+
+            float * logits_out = lctx.new_logits + n_outputs_prev*n_vocab;
+            const int32_t n_outputs_new = lctx.n_outputs;
+
+            if (n_outputs_new) {
+                GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
+                GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
+                ggml_backend_tensor_get_async(backend_res, res, logits_out, 0, n_outputs_new*n_vocab*sizeof(float));
+            }
+        }
+
         // extract embeddings
-        if (embd) {
+        if (embd && batch_all.type == 0) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -14679,6 +14728,47 @@ static int llama_decode_internal(
                     {
                         // extract sequence embeddings (cleared before processing each batch)
                         auto & embd_seq_out = lctx.embd_seq;
+
+                        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+                            const llama_seq_id seq_id = ubatch.seq_id[s][0];
+                            if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
+                                continue;
+                            }
+                            embd_seq_out[seq_id].resize(n_embd);
+                            ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[seq_id].data(), (n_embd*seq_id)*sizeof(float), n_embd*sizeof(float));
+                        }
+                    } break;
+                case LLAMA_POOLING_TYPE_UNSPECIFIED:
+                    {
+                        GGML_ABORT("unknown pooling type");
+                    }
+            }
+        }
+
+        if (embd && batch_all.type == 1) {
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
+            GGML_ASSERT(backend_embd != nullptr);
+
+            switch (cparams.pooling_type) {
+                case LLAMA_POOLING_TYPE_NONE:
+                    {
+                        // extract token embeddings
+                        GGML_ASSERT(lctx.new_embd != nullptr);
+                        float * embd_out = lctx.new_embd + n_outputs_prev*n_embd;
+                        const int32_t n_outputs_new = lctx.n_outputs;
+
+                        if (n_outputs_new) {
+                            GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
+                            GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_embd <= (int64_t) lctx.embd_size);
+                            ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_outputs_new*n_embd*sizeof(float));
+                        }
+                    } break;
+                case LLAMA_POOLING_TYPE_MEAN:
+                case LLAMA_POOLING_TYPE_CLS:
+                case LLAMA_POOLING_TYPE_LAST:
+                    {
+                        // extract sequence embeddings (cleared before processing each batch)
+                        auto & embd_seq_out = lctx.new_embd_seq;
 
                         for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
                             const llama_seq_id seq_id = ubatch.seq_id[s][0];
@@ -16893,6 +16983,10 @@ uint32_t llama_n_ctx(const struct llama_context * ctx) {
     return ctx->cparams.n_ctx;
 }
 
+uint32_t llama_n_ctx(const struct llama_context * ctx) {
+    return ctx->type = 1;
+}
+
 uint32_t llama_n_batch(const struct llama_context * ctx) {
     return ctx->cparams.n_batch;
 }
@@ -18377,6 +18471,27 @@ struct llama_batch llama_batch_get_one(
         /*all_pos_0      =*/ pos_0,
         /*all_pos_1      =*/ 1,
         /*all_seq_id     =*/ seq_id,
+        /*type           =*/ 0,
+    };
+}
+
+struct llama_batch llama_batch_new_one(
+             llama_token * tokens,
+                 int32_t   n_tokens,
+               llama_pos   pos_0,
+            llama_seq_id   seq_id) {
+    return {
+        /*n_tokens       =*/ n_tokens,
+        /*tokens         =*/ tokens,
+        /*embd           =*/ nullptr,
+        /*pos            =*/ nullptr,
+        /*n_seq_id       =*/ nullptr,
+        /*seq_id         =*/ nullptr,
+        /*logits         =*/ nullptr,
+        /*all_pos_0      =*/ pos_0,
+        /*all_pos_1      =*/ 1,
+        /*all_seq_id     =*/ seq_id,
+        /*type           =*/ 1,
     };
 }
 
@@ -18392,6 +18507,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*all_pos_0      =*/ 0,
         /*all_pos_1      =*/ 0,
         /*all_seq_id     =*/ 0,
+        /*type           =*/ 0,
     };
 
     if (embd) {
