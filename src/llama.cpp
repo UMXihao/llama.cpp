@@ -2906,6 +2906,7 @@ struct llama_sbatch {
             /*n_seq_id     =*/ ubatch_n_seq_id.data(),
             /*seq_id       =*/ ubatch_seq_id.data(),
             /*output       =*/ ubatch_output.data(),
+            /*type         =*/ 0,
         };
         return ubatch;
     }
@@ -14822,7 +14823,7 @@ static int llama_decode_internal(
             }
             // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
 
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            ggml_backend_sched_alloc_graph(lctx.new_sched, gf);
 
             llama_set_inputs(lctx, ubatch);
 
@@ -14844,7 +14845,7 @@ static int llama_decode_internal(
             //}
 
             // extract logits
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.new_sched, res);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(lctx.new_logits != nullptr);
 
@@ -14858,7 +14859,7 @@ static int llama_decode_internal(
                                               n_outputs_new * n_vocab * sizeof(float));
             }
 
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.new_sched, embd);
             GGML_ASSERT(backend_embd != nullptr);
 
             switch (cparams.pooling_type) {
@@ -15382,7 +15383,7 @@ static void llama_kv_cache_update_internal(struct llama_context & lctx) {
         uint32_t n_seqs = 1; // TODO: worst-case number of sequences
         uint32_t n_tokens = std::min(lctx.cparams.n_ctx, lctx.cparams.n_ubatch);
         llama_token token = llama_token_bos(&lctx.model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
-        llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
+        llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr, 0};
         ggml_cgraph * gf = llama_build_graph(lctx, ubatch, true);
 
         // initialize scheduler with the worst-case graph
@@ -17057,7 +17058,7 @@ struct llama_context * llama_new_context_with_model(
             uint32_t n_seqs = 1; // TODO: worst-case number of sequences
             uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
-            llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
+            llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr, 0};
             ggml_cgraph * gf = llama_build_graph(*ctx, ubatch, true);
 
             // initialize scheduler with the worst-case graph
