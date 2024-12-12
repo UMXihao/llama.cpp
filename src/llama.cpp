@@ -14614,7 +14614,7 @@ static int llama_decode_internal(
             LLAMA_LOG_INFO("begin to llama_build_graph\n");
             // TODO 计算图也需要进行分支处理
             ggml_cgraph *gf = llama_build_graph(lctx, ubatch, false);
-
+            LLAMA_LOG_INFO("finish llama_build_graph\n");
             // the output is always the last tensor in the graph
             struct ggml_tensor *res = gf->nodes[gf->n_nodes - 1];
             struct ggml_tensor *embd = gf->nodes[gf->n_nodes - 2];
@@ -14638,11 +14638,11 @@ static int llama_decode_internal(
                 GGML_ASSERT(strcmp(res->name, "result_output") == 0 && "missing result_output tensor");
             }
             // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
-            LLAMA_LOG_INFO("begin to llama_build_graph\n");
+            LLAMA_LOG_INFO("begin to ggml_backend_sched_alloc_graph\n");
             ggml_backend_sched_alloc_graph(lctx.sched, gf);
-            LLAMA_LOG_INFO("begin to llama_build_graph\n");
+            LLAMA_LOG_INFO("begin to llama_set_inputs\n");
             llama_set_inputs(lctx, ubatch);
-            LLAMA_LOG_INFO("begin to llama_build_graph\n");
+            LLAMA_LOG_INFO("begin to llama_graph_compute\n");
             llama_graph_compute(lctx, gf, n_threads, threadpool);
 
             // update the kv ring buffer
