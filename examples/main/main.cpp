@@ -505,6 +505,7 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
                 } else {
+                    LOG("start to decode.\n");
                     // decode phase: starting parallel thread
                     std::thread origin(llama_decode, ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0));
                     std::thread new_thread(llama_decode, ctx, llama_batch_new_one(&embd[i], n_eval, n_past, 0));

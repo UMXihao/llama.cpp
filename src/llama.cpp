@@ -14514,7 +14514,7 @@ static int llama_decode_internal(
 
     lctx.embd_seq.clear();
     lctx.new_embd_seq.clear();
-
+    LLAMA_LOG_INFO("begin to count outputs\n");
     // count outputs
     if (batch_all.logits && !embd_pooled) {
         for (uint32_t i = 0; i < n_tokens_all; ++i) {
@@ -14526,7 +14526,7 @@ static int llama_decode_internal(
         // keep last output only
         n_outputs = 1;
     }
-
+    LLAMA_LOG_INFO("begin to sequence-batch\n");
     // 类型判断，完成sequence-batch转换
     if (batch_all.type == 0) {
         lctx.sbatch.from_batch(batch_all, n_embd,
@@ -14543,7 +14543,7 @@ static int llama_decode_internal(
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_outputs);
         return -2;
     };
-
+    LLAMA_LOG_INFO("begin to compute\n");
     if (batch_all.type == 0) {
         while (lctx.sbatch.n_tokens > 0) {
             llama_ubatch ubatch;
