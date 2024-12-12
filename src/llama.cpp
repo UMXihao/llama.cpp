@@ -14582,7 +14582,7 @@ static int llama_decode_internal(
             ggml_threadpool_t threadpool = n_tokens == 1 ? lctx.threadpool : lctx.threadpool_batch;
 
             GGML_ASSERT(n_threads > 0);
-
+            LLAMA_LOG_INFO("begin to use the KV cache\n");
             // non-causal masks do not use the KV cache
             if (hparams.causal_attn) {
                 llama_kv_cache_update(&lctx);
@@ -14611,7 +14611,7 @@ static int llama_decode_internal(
 
             ggml_backend_sched_reset(lctx.sched);
             ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
-
+            LLAMA_LOG_INFO("begin to llama_build_graph\n");
             // TODO 计算图也需要进行分支处理
             ggml_cgraph *gf = llama_build_graph(lctx, ubatch, false);
 
@@ -14638,11 +14638,11 @@ static int llama_decode_internal(
                 GGML_ASSERT(strcmp(res->name, "result_output") == 0 && "missing result_output tensor");
             }
             // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
-
+            LLAMA_LOG_INFO("begin to llama_build_graph\n");
             ggml_backend_sched_alloc_graph(lctx.sched, gf);
-
+            LLAMA_LOG_INFO("begin to llama_build_graph\n");
             llama_set_inputs(lctx, ubatch);
-
+            LLAMA_LOG_INFO("begin to llama_build_graph\n");
             llama_graph_compute(lctx, gf, n_threads, threadpool);
 
             // update the kv ring buffer
@@ -14659,7 +14659,7 @@ static int llama_decode_internal(
             //if (n_past%100 == 0) {
             //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
             //}
-
+            LLAMA_LOG_INFO("begin to extract logits\n");
             // extract logits
             if (res) {
                 ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
@@ -14676,7 +14676,7 @@ static int llama_decode_internal(
                                                   n_outputs_new * n_vocab * sizeof(float));
                 }
             }
-
+            LLAMA_LOG_INFO("begin to embeddings\n");
             // extract embeddings
             if (embd) {
                 ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
