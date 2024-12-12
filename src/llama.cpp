@@ -14352,8 +14352,6 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
             lctx.buf_output = nullptr;
             lctx.logits = nullptr;
             lctx.embd = nullptr;
-            lctx.new_logits = nullptr;
-            lctx.new_embd = nullptr;
         }
 
         lctx.buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), new_size);
@@ -14367,8 +14365,6 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 
     lctx.logits = has_logits ? output_base               : nullptr;
     lctx.embd   = has_embd   ? output_base + logits_size : nullptr;
-    lctx.new_logits = has_logits ? output_base               : nullptr;
-    lctx.new_embd   = has_embd   ? output_base + logits_size : nullptr;
 
     lctx.output_size = n_outputs_max;
     lctx.logits_size = logits_size;
@@ -18402,7 +18398,6 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*all_pos_0      =*/ 0,
         /*all_pos_1      =*/ 0,
         /*all_seq_id     =*/ 0,
-        /*type           =*/ 0,
     };
 
     if (embd) {
