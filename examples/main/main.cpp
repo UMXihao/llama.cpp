@@ -498,22 +498,26 @@ int main(int argc, char ** argv) {
 
                 LOG("eval: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
 
-                if (n_past == 0) {
-                    // prefill phase: origin calculation type
-                    if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
-                        LOG_TEE("%s : failed to eval\n", __func__);
-                        return 1;
-                    }
-                } else {
-                    LOG("start to decode.\n");
-                    // decode phase: starting parallel thread
-                    std::thread origin(llama_decode, ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0));
-                    std::thread new_thread(llama_decode, ctx, llama_batch_new_one(&embd[i], n_eval, n_past, 0));
-
-                    // 等待两个线程完成
-                    origin.join();
-                    new_thread.join();
+                if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
+                    LOG_TEE("%s : failed to eval\n", __func__);
+                    return 1;
                 }
+                // if (n_past == 0) {
+                //     // prefill phase: origin calculation type
+                //     if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
+                //         LOG_TEE("%s : failed to eval\n", __func__);
+                //         return 1;
+                //     }
+                // } else {
+                //     LOG("start to decode.\n");
+                //     // decode phase: starting parallel thread
+                //     std::thread origin(llama_decode, ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0));
+                //     std::thread new_thread(llama_decode, ctx, llama_batch_new_one(&embd[i], n_eval, n_past, 0));
+                //
+                //     // 等待两个线程完成
+                //     origin.join();
+                //     new_thread.join();
+                // }
 
                 n_past += n_eval;
 

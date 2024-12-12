@@ -3197,11 +3197,8 @@ struct llama_context {
 
     struct llama_cparams        cparams;
     struct llama_sbatch         sbatch;
-    struct llama_sbatch         new_sbatch; // new thread
 
     struct llama_kv_cache       kv_self; // share KV - first token
-    struct llama_kv_cache       kv_origin; // origin KV
-    struct llama_kv_cache       kv_new_thread; // new thread KV
     struct llama_control_vector cvec;
 
     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
@@ -3237,7 +3234,6 @@ struct llama_context {
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     size_t  logits_size = 0; // capacity (of floats) for logits
     float * logits      = nullptr;
-    float * new_logits      = nullptr; // new thread
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
     size_t  output_size = 0; // capacity (of tokens positions) for the output buffers
@@ -3249,12 +3245,10 @@ struct llama_context {
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     size_t  embd_size = 0; // capacity (of floats) for embeddings
     float * embd      = nullptr;
-    float * new_embd      = nullptr; // new thread，主要目的就是获取该值
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
-    std::map<llama_seq_id, std::vector<float>> new_embd_seq; // new thread
 
     // whether we are computing encoder output or decoder output
     bool is_encoding = false;
@@ -3266,7 +3260,6 @@ struct llama_context {
     // memory buffers used to evaluate the model
     std::vector<uint8_t> buf_compute_meta;
     ggml_backend_sched_t sched = nullptr;
-    ggml_backend_sched_t new_sched = nullptr;
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
@@ -14513,7 +14506,7 @@ static int llama_decode_internal(
     const bool embd_pooled = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
 
     lctx.embd_seq.clear();
-    lctx.new_embd_seq.clear();
+
     LLAMA_LOG_INFO("begin to count outputs\n");
     // count outputs
     if (batch_all.logits && !embd_pooled) {
@@ -14528,439 +14521,235 @@ static int llama_decode_internal(
     }
     LLAMA_LOG_INFO("begin to sequence-batch\n");
     // 类型判断，完成sequence-batch转换
-    if (batch_all.type == 0) {
-        lctx.sbatch.from_batch(batch_all, n_embd,
+    lctx.sbatch.from_batch(batch_all, n_embd,
         /* simple_split */ !kv_self.recurrent,
         /* logits_all   */ n_outputs == n_tokens_all);
-    } else {
-        lctx.new_sbatch.from_batch(batch_all, n_embd,
-        /* simple_split */ !kv_self.recurrent,
-        /* logits_all   */ n_outputs == n_tokens_all);
-    }
 
     // reserve output buffer
     if (llama_output_reserve(lctx, n_outputs) < n_outputs) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_outputs);
         return -2;
     };
-    LLAMA_LOG_INFO("begin to compute\n");
-    if (batch_all.type == 0) {
-        while (lctx.sbatch.n_tokens > 0) {
-            llama_ubatch ubatch;
-            if (kv_self.recurrent) {
-                if (embd_pooled) {
-                    // Pooled embeddings cannot be split across ubatches (yet)
-                    ubatch = lctx.sbatch.split_seq(n_ubatch);
-                } else {
-                    // recurrent model architectures are easier to implement
-                    // with equal-length sequences
-                    ubatch = lctx.sbatch.split_equal(n_ubatch);
-                }
+
+    while (lctx.sbatch.n_tokens > 0) {
+        llama_ubatch ubatch;
+        if (kv_self.recurrent) {
+            if (embd_pooled) {
+                // Pooled embeddings cannot be split across ubatches (yet)
+                ubatch = lctx.sbatch.split_seq(n_ubatch);
             } else {
-                ubatch = lctx.sbatch.split_simple(n_ubatch);
+                // recurrent model architectures are easier to implement
+                // with equal-length sequences
+                ubatch = lctx.sbatch.split_equal(n_ubatch);
             }
-            const uint32_t n_tokens = ubatch.n_tokens;
-
-            // count the outputs in this u_batch
-            {
-                int32_t n_outputs_new = 0;
-
-                if (n_outputs == n_tokens_all) {
-                    n_outputs_new = n_tokens;
-                } else {
-                    GGML_ASSERT(ubatch.output);
-                    for (uint32_t i = 0; i < n_tokens; i++) {
-                        n_outputs_new += (int32_t) (ubatch.output[i] != 0);
-                    }
-                }
-
-                // needs to happen before the graph is built
-                lctx.n_outputs = n_outputs_new;
-            }
-
-            int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
-            ggml_threadpool_t threadpool = n_tokens == 1 ? lctx.threadpool : lctx.threadpool_batch;
-
-            GGML_ASSERT(n_threads > 0);
-            LLAMA_LOG_INFO("begin to use the KV cache\n");
-            // non-causal masks do not use the KV cache
-            if (hparams.causal_attn) {
-                llama_kv_cache_update(&lctx);
-
-                // if we have enough unused cells before the current head ->
-                //   better to start searching from the beginning of the cache, hoping to fill it
-                if (kv_self.head > kv_self.used + 2 * n_tokens) {
-                    kv_self.head = 0;
-                }
-
-                if (!llama_kv_cache_find_slot(kv_self, ubatch)) {
-                    return 1;
-                }
-
-                if (!kv_self.recurrent) {
-                    // a heuristic, to avoid attending the full cache if it is not yet utilized
-                    // after enough generations, the benefit from this heuristic disappears
-                    // if we start defragmenting the cache, the benefit from this will be more important
-                    const uint32_t pad = llama_kv_cache_get_padding(cparams);
-                    kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(llama_kv_cache_cell_max(kv_self), pad)));
-                    //kv_self.n = llama_kv_cache_cell_max(kv_self);
-                }
-            }
-
-            //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
-
-            ggml_backend_sched_reset(lctx.sched);
-            ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
-            LLAMA_LOG_INFO("begin to llama_build_graph\n");
-            // TODO 计算图也需要进行分支处理
-            ggml_cgraph *gf = llama_build_graph(lctx, ubatch, false);
-            LLAMA_LOG_INFO("finish llama_build_graph\n");
-            // the output is always the last tensor in the graph
-            struct ggml_tensor *res = gf->nodes[gf->n_nodes - 1];
-            struct ggml_tensor *embd = gf->nodes[gf->n_nodes - 2];
-
-            if (lctx.n_outputs == 0) {
-                // no output
-                res = nullptr;
-                embd = nullptr;
-            } else if (cparams.embeddings) {
-                res = nullptr; // do not extract logits for embedding case
-                embd = nullptr;
-                for (int i = gf->n_nodes - 1; i >= 0; --i) {
-                    if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
-                        embd = gf->nodes[i];
-                        break;
-                    }
-                }
-                GGML_ASSERT(embd != nullptr && "missing embeddings tensor");
-            } else {
-                embd = nullptr; // do not extract embeddings when not needed
-                GGML_ASSERT(strcmp(res->name, "result_output") == 0 && "missing result_output tensor");
-            }
-            // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
-            LLAMA_LOG_INFO("begin to ggml_backend_sched_alloc_graph\n");
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
-            LLAMA_LOG_INFO("begin to llama_set_inputs\n");
-            llama_set_inputs(lctx, ubatch);
-            LLAMA_LOG_INFO("begin to llama_graph_compute\n");
-            llama_graph_compute(lctx, gf, n_threads, threadpool);
-
-            // update the kv ring buffer
-            {
-                kv_self.head += n_tokens;
-
-                // Ensure kv cache head points to a valid index.
-                if (kv_self.head >= kv_self.size) {
-                    kv_self.head = 0;
-                }
-            }
-
-            // plot the computation graph in dot format (for debugging purposes)
-            //if (n_past%100 == 0) {
-            //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-            //}
-            LLAMA_LOG_INFO("begin to extract logits\n");
-            // extract logits
-            if (res) {
-                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
-                GGML_ASSERT(backend_res != nullptr);
-                GGML_ASSERT(lctx.logits != nullptr);
-
-                float *logits_out = lctx.logits + n_outputs_prev * n_vocab;
-                const int32_t n_outputs_new = lctx.n_outputs;
-
-                if (n_outputs_new) {
-                    GGML_ASSERT(n_outputs_prev + n_outputs_new <= n_outputs);
-                    GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
-                    ggml_backend_tensor_get_async(backend_res, res, logits_out, 0,
-                                                  n_outputs_new * n_vocab * sizeof(float));
-                }
-            }
-            LLAMA_LOG_INFO("begin to embeddings\n");
-            // extract embeddings
-            if (embd) {
-                ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
-                GGML_ASSERT(backend_embd != nullptr);
-
-                switch (cparams.pooling_type) {
-                    case LLAMA_POOLING_TYPE_NONE: {
-                        // extract token embeddings
-                        GGML_ASSERT(lctx.embd != nullptr);
-                        float *embd_out = lctx.embd + n_outputs_prev * n_embd;
-                        const int32_t n_outputs_new = lctx.n_outputs;
-
-                        if (n_outputs_new) {
-                            GGML_ASSERT(n_outputs_prev + n_outputs_new <= n_outputs);
-                            GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_embd <= (int64_t) lctx.embd_size);
-                            ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0,
-                                                          n_outputs_new * n_embd * sizeof(float));
-                        }
-                    }
-                    break;
-                    case LLAMA_POOLING_TYPE_MEAN:
-                    case LLAMA_POOLING_TYPE_CLS:
-                    case LLAMA_POOLING_TYPE_LAST: {
-                        // extract sequence embeddings (cleared before processing each batch)
-                        auto &embd_seq_out = lctx.embd_seq;
-
-                        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
-                            const llama_seq_id seq_id = ubatch.seq_id[s][0];
-                            if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
-                                continue;
-                            }
-                            embd_seq_out[seq_id].resize(n_embd);
-                            ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[seq_id].data(),
-                                                          (n_embd * seq_id) * sizeof(float), n_embd * sizeof(float));
-                        }
-                    }
-                    break;
-                    case LLAMA_POOLING_TYPE_UNSPECIFIED: {
-                        GGML_ABORT("unknown pooling type");
-                    }
-                }
-            }
-
-            n_outputs_prev += lctx.n_outputs;
+        } else {
+            ubatch = lctx.sbatch.split_simple(n_ubatch);
         }
-        // set output mappings
+        const uint32_t n_tokens = ubatch.n_tokens;
+
+        // count the outputs in this u_batch
         {
-            bool sorted_output = true;
+            int32_t n_outputs_new = 0;
 
-            GGML_ASSERT(lctx.sbatch.out_ids.size() == n_outputs);
-
-            for (size_t i = 0; i < n_outputs; ++i) {
-                size_t out_id = lctx.sbatch.out_ids[i];
-                lctx.output_ids[out_id] = i;
-                if (out_id != i) {
-                    sorted_output = false;
+            if (n_outputs == n_tokens_all) {
+                n_outputs_new = n_tokens;
+            } else {
+                GGML_ASSERT(ubatch.output);
+                for (uint32_t i = 0; i < n_tokens; i++) {
+                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
                 }
             }
 
-            if (sorted_output) {
-                lctx.sbatch.out_ids.clear();
+            // needs to happen before the graph is built
+            lctx.n_outputs = n_outputs_new;
+        }
+
+        int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
+        ggml_threadpool_t threadpool = n_tokens == 1 ? lctx.threadpool : lctx.threadpool_batch;
+
+        GGML_ASSERT(n_threads > 0);
+        LLAMA_LOG_INFO("begin to use the KV cache\n");
+        // non-causal masks do not use the KV cache
+        if (hparams.causal_attn) {
+            llama_kv_cache_update(&lctx);
+
+            // if we have enough unused cells before the current head ->
+            //   better to start searching from the beginning of the cache, hoping to fill it
+            if (kv_self.head > kv_self.used + 2 * n_tokens) {
+                kv_self.head = 0;
+            }
+
+            if (!llama_kv_cache_find_slot(kv_self, ubatch)) {
+                return 1;
+            }
+
+            if (!kv_self.recurrent) {
+                // a heuristic, to avoid attending the full cache if it is not yet utilized
+                // after enough generations, the benefit from this heuristic disappears
+                // if we start defragmenting the cache, the benefit from this will be more important
+                const uint32_t pad = llama_kv_cache_get_padding(cparams);
+                kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(llama_kv_cache_cell_max(kv_self), pad)));
+                //kv_self.n = llama_kv_cache_cell_max(kv_self);
             }
         }
 
-        // set to total number of outputs in the batch, for use in llama_get_logits_ith
-        lctx.n_outputs = n_outputs;
+        //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
 
-        // wait for the computation to finish (automatically done when obtaining the model output)
-        //llama_synchronize(&lctx);
-
-        // decide if we need to defrag the kv cache
-        if (cparams.causal_attn && cparams.defrag_thold >= 0.0f) {
-            const float fragmentation = kv_self.n >= 128 ? 1.0f - float(kv_self.used) / float(kv_self.n) : 0.0f;
-
-            // queue defragmentation for next llama_kv_cache_update
-            if (fragmentation > cparams.defrag_thold) {
-                //LLAMA_LOG_INFO("fragmentation: %.2f\n", fragmentation);
-
-                llama_kv_cache_defrag(kv_self);
-            }
-        }
-
-        // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
-        // overlap with device computation.
         ggml_backend_sched_reset(lctx.sched);
+        ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+        LLAMA_LOG_INFO("begin to llama_build_graph\n");
+        // TODO 计算图也需要进行分支处理
+        ggml_cgraph *gf = llama_build_graph(lctx, ubatch, false);
+        LLAMA_LOG_INFO("finish llama_build_graph\n");
+        // the output is always the last tensor in the graph
+        struct ggml_tensor *res = gf->nodes[gf->n_nodes - 1];
+        struct ggml_tensor *embd = gf->nodes[gf->n_nodes - 2];
 
-        return 0;
-    } else {
-        while (lctx.new_sbatch.n_tokens > 0) {
-            llama_ubatch ubatch;
-            if (kv_self.recurrent) {
-                if (embd_pooled) {
-                    // Pooled embeddings cannot be split across ubatches (yet)
-                    ubatch = lctx.new_sbatch.split_seq(n_ubatch);
-                } else {
-                    // recurrent model architectures are easier to implement
-                    // with equal-length sequences
-                    ubatch = lctx.new_sbatch.split_equal(n_ubatch);
-                }
-            } else {
-                ubatch = lctx.new_sbatch.split_simple(n_ubatch);
-            }
-            const uint32_t n_tokens = ubatch.n_tokens;
-
-            // count the outputs in this u_batch
-            {
-                int32_t n_outputs_new = 0;
-
-                if (n_outputs == n_tokens_all) {
-                    n_outputs_new = n_tokens;
-                } else {
-                    GGML_ASSERT(ubatch.output);
-                    for (uint32_t i = 0; i < n_tokens; i++) {
-                        n_outputs_new += (int32_t) (ubatch.output[i] != 0);
-                    }
-                }
-
-                // needs to happen before the graph is built
-                lctx.n_outputs = n_outputs_new;
-            }
-
-            int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
-            ggml_threadpool_t threadpool = n_tokens == 1 ? lctx.threadpool : lctx.threadpool_batch;
-
-            GGML_ASSERT(n_threads > 0);
-
-            // non-causal masks do not use the KV cache
-            if (hparams.causal_attn) {
-                llama_kv_cache_update(&lctx);
-
-                // if we have enough unused cells before the current head ->
-                //   better to start searching from the beginning of the cache, hoping to fill it
-                if (kv_self.head > kv_self.used + 2 * n_tokens) {
-                    kv_self.head = 0;
-                }
-
-                if (!llama_kv_cache_find_slot(kv_self, ubatch)) {
-                    return 1;
-                }
-
-                if (!kv_self.recurrent) {
-                    // a heuristic, to avoid attending the full cache if it is not yet utilized
-                    // after enough generations, the benefit from this heuristic disappears
-                    // if we start defragmenting the cache, the benefit from this will be more important
-                    const uint32_t pad = llama_kv_cache_get_padding(cparams);
-                    kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(llama_kv_cache_cell_max(kv_self), pad)));
-                    //kv_self.n = llama_kv_cache_cell_max(kv_self);
-                }
-            }
-
-            //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
-
-            ggml_backend_sched_reset(lctx.new_sched);
-            ggml_backend_sched_set_eval_callback(lctx.new_sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
-
-            // TODO 计算图也需要进行分支处理
-            ggml_cgraph *gf = llama_build_graph(lctx, ubatch, false);
-
-            // the output is always the last tensor in the graph
-            struct ggml_tensor *res = gf->nodes[gf->n_nodes - 1];
-            struct ggml_tensor *embd = gf->nodes[gf->n_nodes - 2];
-
-            if (lctx.n_outputs == 0) {
-                // no output
-                res = nullptr;
-                embd = nullptr;
-            } else if (cparams.embeddings) {
-                res = nullptr; // do not extract logits for embedding case
-                embd = nullptr;
-                for (int i = gf->n_nodes - 1; i >= 0; --i) {
-                    if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
-                        embd = gf->nodes[i];
-                        break;
-                    }
-                }
-                GGML_ASSERT(embd != nullptr && "missing embeddings tensor");
-            } else {
-                embd = nullptr; // do not extract embeddings when not needed
-                GGML_ASSERT(strcmp(res->name, "result_output") == 0 && "missing result_output tensor");
-            }
-            // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
-
-            ggml_backend_sched_alloc_graph(lctx.new_sched, gf);
-
-            llama_set_inputs(lctx, ubatch);
-
-            llama_graph_compute(lctx, gf, n_threads, threadpool);
-
-            // update the kv ring buffer
-            {
-                kv_self.head += n_tokens;
-
-                // Ensure kv cache head points to a valid index.
-                if (kv_self.head >= kv_self.size) {
-                    kv_self.head = 0;
-                }
-            }
-
-            // plot the computation graph in dot format (for debugging purposes)
-            //if (n_past%100 == 0) {
-            //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-            //}
-
-            // extract logits
-            if (res) {
-                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.new_sched, res);
-                GGML_ASSERT(backend_res != nullptr);
-                GGML_ASSERT(lctx.new_logits != nullptr);
-
-                float *logits_out = lctx.new_logits + n_outputs_prev * n_vocab;
-                const int32_t n_outputs_new = lctx.n_outputs;
-
-                if (n_outputs_new) {
-                    GGML_ASSERT(n_outputs_prev + n_outputs_new <= n_outputs);
-                    GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
-                    ggml_backend_tensor_get_async(backend_res, res, logits_out, 0,
-                                                  n_outputs_new * n_vocab * sizeof(float));
-                }
-            }
-
-            // extract embeddings
-            if (embd) {
-                ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.new_sched, embd);
-                GGML_ASSERT(backend_embd != nullptr);
-
-                switch (cparams.pooling_type) {
-                    case LLAMA_POOLING_TYPE_NONE: {
-                        // extract token embeddings
-                        GGML_ASSERT(lctx.new_embd != nullptr);
-                        float *embd_out = lctx.new_embd + n_outputs_prev * n_embd;
-                        const int32_t n_outputs_new = lctx.n_outputs;
-
-                        if (n_outputs_new) {
-                            GGML_ASSERT(n_outputs_prev + n_outputs_new <= n_outputs);
-                            GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_embd <= (int64_t) lctx.embd_size);
-                            ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0,
-                                                          n_outputs_new * n_embd * sizeof(float));
-                        }
-                    }
+        if (lctx.n_outputs == 0) {
+            // no output
+            res = nullptr;
+            embd = nullptr;
+        } else if (cparams.embeddings) {
+            res = nullptr; // do not extract logits for embedding case
+            embd = nullptr;
+            for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
+                    embd = gf->nodes[i];
                     break;
-                    case LLAMA_POOLING_TYPE_MEAN:
-                    case LLAMA_POOLING_TYPE_CLS:
-                    case LLAMA_POOLING_TYPE_LAST: {
-                        // extract sequence embeddings (cleared before processing each batch)
-                        auto &embd_seq_out = lctx.new_embd_seq;
-
-                        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
-                            const llama_seq_id seq_id = ubatch.seq_id[s][0];
-                            if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
-                                continue;
-                            }
-                            embd_seq_out[seq_id].resize(n_embd);
-                            ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[seq_id].data(),
-                                                          (n_embd * seq_id) * sizeof(float), n_embd * sizeof(float));
-                        }
-                    }
-                    break;
-                    case LLAMA_POOLING_TYPE_UNSPECIFIED: {
-                        GGML_ABORT("unknown pooling type");
-                    }
                 }
             }
-
-            n_outputs_prev += lctx.n_outputs;
+            GGML_ASSERT(embd != nullptr && "missing embeddings tensor");
+        } else {
+            embd = nullptr; // do not extract embeddings when not needed
+            GGML_ASSERT(strcmp(res->name, "result_output") == 0 && "missing result_output tensor");
         }
+        // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
+        LLAMA_LOG_INFO("begin to ggml_backend_sched_alloc_graph\n");
+        ggml_backend_sched_alloc_graph(lctx.sched, gf);
+        LLAMA_LOG_INFO("begin to llama_set_inputs\n");
+        llama_set_inputs(lctx, ubatch);
+        LLAMA_LOG_INFO("begin to llama_graph_compute\n");
+        llama_graph_compute(lctx, gf, n_threads, threadpool);
 
-        // decide if we need to defrag the kv cache
-        if (cparams.causal_attn && cparams.defrag_thold >= 0.0f) {
-            const float fragmentation = kv_self.n >= 128 ? 1.0f - float(kv_self.used) / float(kv_self.n) : 0.0f;
+        // update the kv ring buffer
+        {
+            kv_self.head += n_tokens;
 
-            // queue defragmentation for next llama_kv_cache_update
-            if (fragmentation > cparams.defrag_thold) {
-                //LLAMA_LOG_INFO("fragmentation: %.2f\n", fragmentation);
-
-                llama_kv_cache_defrag(kv_self);
+            // Ensure kv cache head points to a valid index.
+            if (kv_self.head >= kv_self.size) {
+                kv_self.head = 0;
             }
         }
 
-        // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
-        // overlap with device computation.
-        ggml_backend_sched_reset(lctx.new_sched);
+        // plot the computation graph in dot format (for debugging purposes)
+        //if (n_past%100 == 0) {
+        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
+        //}
+        LLAMA_LOG_INFO("begin to extract logits\n");
+        // extract logits
+        if (res) {
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
+            GGML_ASSERT(backend_res != nullptr);
+            GGML_ASSERT(lctx.logits != nullptr);
 
-        return 0;
+            float *logits_out = lctx.logits + n_outputs_prev * n_vocab;
+            const int32_t n_outputs_new = lctx.n_outputs;
+
+            if (n_outputs_new) {
+                GGML_ASSERT(n_outputs_prev + n_outputs_new <= n_outputs);
+                GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
+                ggml_backend_tensor_get_async(backend_res, res, logits_out, 0,
+                                              n_outputs_new * n_vocab * sizeof(float));
+            }
+        }
+        LLAMA_LOG_INFO("begin to embeddings\n");
+        // extract embeddings
+        if (embd) {
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
+            GGML_ASSERT(backend_embd != nullptr);
+
+            switch (cparams.pooling_type) {
+                case LLAMA_POOLING_TYPE_NONE: {
+                    // extract token embeddings
+                    GGML_ASSERT(lctx.embd != nullptr);
+                    float *embd_out = lctx.embd + n_outputs_prev * n_embd;
+                    const int32_t n_outputs_new = lctx.n_outputs;
+
+                    if (n_outputs_new) {
+                        GGML_ASSERT(n_outputs_prev + n_outputs_new <= n_outputs);
+                        GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_embd <= (int64_t) lctx.embd_size);
+                        ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0,
+                                                      n_outputs_new * n_embd * sizeof(float));
+                    }
+                }
+                break;
+                case LLAMA_POOLING_TYPE_MEAN:
+                case LLAMA_POOLING_TYPE_CLS:
+                case LLAMA_POOLING_TYPE_LAST: {
+                    // extract sequence embeddings (cleared before processing each batch)
+                    auto &embd_seq_out = lctx.embd_seq;
+
+                    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+                        const llama_seq_id seq_id = ubatch.seq_id[s][0];
+                        if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
+                            continue;
+                        }
+                        embd_seq_out[seq_id].resize(n_embd);
+                        ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[seq_id].data(),
+                                                      (n_embd * seq_id) * sizeof(float), n_embd * sizeof(float));
+                    }
+                }
+                break;
+                case LLAMA_POOLING_TYPE_UNSPECIFIED: {
+                    GGML_ABORT("unknown pooling type");
+                }
+            }
+        }
+
+        n_outputs_prev += lctx.n_outputs;
     }
+    // set output mappings
+    {
+        bool sorted_output = true;
+
+        GGML_ASSERT(lctx.sbatch.out_ids.size() == n_outputs);
+
+        for (size_t i = 0; i < n_outputs; ++i) {
+            size_t out_id = lctx.sbatch.out_ids[i];
+            lctx.output_ids[out_id] = i;
+            if (out_id != i) {
+                sorted_output = false;
+            }
+        }
+
+        if (sorted_output) {
+            lctx.sbatch.out_ids.clear();
+        }
+    }
+
+    // set to total number of outputs in the batch, for use in llama_get_logits_ith
+    lctx.n_outputs = n_outputs;
+
+    // wait for the computation to finish (automatically done when obtaining the model output)
+    //llama_synchronize(&lctx);
+
+    // decide if we need to defrag the kv cache
+    if (cparams.causal_attn && cparams.defrag_thold >= 0.0f) {
+        const float fragmentation = kv_self.n >= 128 ? 1.0f - float(kv_self.used) / float(kv_self.n) : 0.0f;
+
+        // queue defragmentation for next llama_kv_cache_update
+        if (fragmentation > cparams.defrag_thold) {
+            //LLAMA_LOG_INFO("fragmentation: %.2f\n", fragmentation);
+
+            llama_kv_cache_defrag(kv_self);
+        }
+    }
+
+    // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
+    // overlap with device computation.
+    ggml_backend_sched_reset(lctx.sched);
+
+    return 0;
 }
 
 // encode a batch of tokens by evaluating the encoder part of the transformer
@@ -18598,27 +18387,6 @@ struct llama_batch llama_batch_get_one(
         /*all_pos_0      =*/ pos_0,
         /*all_pos_1      =*/ 1,
         /*all_seq_id     =*/ seq_id,
-        /*type           =*/ 0,
-    };
-}
-
-struct llama_batch llama_batch_new_one(
-             llama_token * tokens,
-                 int32_t   n_tokens,
-               llama_pos   pos_0,
-            llama_seq_id   seq_id) {
-    return {
-        /*n_tokens       =*/ n_tokens,
-        /*tokens         =*/ tokens,
-        /*embd           =*/ nullptr,
-        /*pos            =*/ nullptr,
-        /*n_seq_id       =*/ nullptr,
-        /*seq_id         =*/ nullptr,
-        /*logits         =*/ nullptr,
-        /*all_pos_0      =*/ pos_0,
-        /*all_pos_1      =*/ 1,
-        /*all_seq_id     =*/ seq_id,
-        /*type           =*/ 1,
     };
 }
 
