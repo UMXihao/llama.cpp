@@ -2654,6 +2654,7 @@ struct llama_ubatch {
     int32_t      *  n_seq_id; // [n_seqs]
     llama_seq_id ** seq_id;   // [n_seqs]
     int8_t       *  output;   // [n_tokens]
+    int8_t       type;   // [type]
 };
 
 struct llama_kv_cell {
@@ -3025,6 +3026,7 @@ struct llama_sbatch {
         }
         ubatch.n_tokens += length;
         ubatch.n_seqs += ubatch.equal_seqs ? 1 : length; // virtual sequences for simple splits
+        ubatch.type = batch->type;
         seq.offset += length;
         seq.length -= length;
         n_tokens -= length;
@@ -3266,6 +3268,7 @@ struct llama_context {
     // memory buffers used to evaluate the model
     std::vector<uint8_t> buf_compute_meta;
     ggml_backend_sched_t sched = nullptr;
+    ggml_backend_sched_t new_sched = nullptr;
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
@@ -13658,7 +13661,11 @@ static struct ggml_cgraph * llama_build_graph(
         if (!lctx.cparams.offload_kqv) {
             if (strcmp(name, "kqv_merged_cont") == 0) {
                 // all nodes between the KV store and the attention output are run on the CPU
-                ggml_backend_sched_set_tensor_backend(lctx.sched, cur, lctx.backend_cpu);
+                if (batch.type == 0) {
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, cur, lctx.backend_cpu);
+                } else {
+                    ggml_backend_sched_set_tensor_backend(lctx.new_sched, cur, lctx.backend_cpu);
+                }
             }
         }
 
@@ -13670,7 +13677,11 @@ static struct ggml_cgraph * llama_build_graph(
                 for (auto * backend : lctx.backends) {
                     if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[il].buft) &&
                         (ggml_backend_supports_op(backend, cur) || ggml_backend_offload_op(backend, cur))) {
-                        ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
+                        if (batch.type == 0) {
+                            ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
+                        } else {
+                            ggml_backend_sched_set_tensor_backend(lctx.new_sched, cur, backend);
+                        }
                         break;
                     }
                 }
@@ -14781,8 +14792,8 @@ static int llama_decode_internal(
 
             //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
 
-            ggml_backend_sched_reset(lctx.sched);
-            ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            ggml_backend_sched_reset(lctx.new_sched);
+            ggml_backend_sched_set_eval_callback(lctx.new_sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 
             // TODO 计算图也需要进行分支处理
             ggml_cgraph *gf = llama_build_graph(lctx, ubatch, false);
