@@ -8276,27 +8276,9 @@ struct llm_build_context {
 
         struct ggml_tensor * cur;
 
-        switch (pooling_type) {
-            case LLAMA_POOLING_TYPE_MEAN:
-                {
-                    struct ggml_tensor * inp_mean = build_inp_mean();
-                    cur = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, inp)), inp_mean);
-                } break;
-            case LLAMA_POOLING_TYPE_CLS:
-            case LLAMA_POOLING_TYPE_LAST:
-                {
-                    struct ggml_tensor * inp_cls = build_inp_cls();
-                    cur = ggml_get_rows(ctx0, inp, inp_cls);
-                } break;
-            case LLAMA_POOLING_TYPE_NONE:
-                {
-                    cur = inp;
-                } break;
-            default:
-                {
-                    GGML_ABORT("unknown pooling type");
-                }
-        }
+        // 默认输出句子的embedding
+        struct ggml_tensor * inp_mean = build_inp_mean();
+        cur = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, inp)), inp_mean);
 
         cb(cur, "result_embd_pooled", -1);
 
@@ -14569,23 +14551,18 @@ static int llama_decode_internal(
             }
         }
 
-        //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
-
         ggml_backend_sched_reset(lctx.sched);
         ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
-        // TODO 计算图也需要进行分支处理
+
         ggml_cgraph *gf = llama_build_graph(lctx, ubatch, false);
         // the output is always the last tensor in the graph
-        struct ggml_tensor *res = gf->nodes[gf->n_nodes - 1];
         struct ggml_tensor *embd = gf->nodes[gf->n_nodes - 2];
 
         if (lctx.n_outputs == 0) {
             // no output
-            res = nullptr;
             embd = nullptr;
         } else {
             // 默认输出embeddings
-            res = nullptr; // do not extract logits for embedding case
             embd = nullptr;
             for (int i = gf->n_nodes - 1; i >= 0; --i) {
                 if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
