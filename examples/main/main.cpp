@@ -513,23 +513,10 @@ int main(int argc, char ** argv) {
                 } else {
                     // decode phase: add batch
                     llama_batch_add(origin_batch, parallel_embd, n_past + 1, {1}, true);
-                    for (int k = 0; k < 2; k++) {
-                        llama_batch batch_view = {
-                            1,
-                            origin_batch.token    + k,
-                            nullptr,
-                            origin_batch.pos      + k,
-                            origin_batch.n_seq_id + k,
-                            origin_batch.seq_id   + k,
-                            origin_batch.logits   + k,
-                            0, 0, 0, // unused
-                        };
-
-                        const int ret = llama_decode(ctx, batch_view);
-                        if (ret != 0) {
-                            LOG_TEE("%s : parallel decode failed to eval\n", __func__);
-                            return 1;
-                        }
+                    const int ret = llama_decode(ctx, origin_batch);
+                    if (ret != 0) {
+                        LOG_TEE("%s : parallel decode failed to eval\n", __func__);
+                        return 1;
                     }
                 }
 
