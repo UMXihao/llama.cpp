@@ -393,7 +393,6 @@ int main(int argc, char ** argv) {
     display = params.display_prompt;
 
     std::vector<llama_token> embd;
-    llama_token parallel_embd = -1; // 并行解码使用
 
     // tokenized antiprompts
     std::vector<std::vector<llama_token>> antiprompt_ids;
@@ -500,10 +499,7 @@ int main(int argc, char ** argv) {
                 LOG("eval: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
 
                 llama_batch origin_batch = llama_batch_get_one(&embd[i], n_eval, n_past, 0);
-                if (parallel_embd == -1) {
-                    // first generation token
-                    parallel_embd = embd[i];
-                }
+
                 if (llama_decode(ctx, origin_batch)) {
                     LOG_TEE("%s : failed to eval\n", __func__);
                     return 1;
@@ -553,14 +549,6 @@ int main(int argc, char ** argv) {
                     break;
                 }
             }
-        }
-
-        if (parallel_embd != -1) {
-            const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
-
-            gpt_sampler_accept(smpl, id, true);
-
-            parallel_embd = id;
         }
 
         // display text
