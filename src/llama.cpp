@@ -13855,9 +13855,11 @@ static struct ggml_cgraph * llama_build_graph(
     }
 
     // add on pooling layer
-    if (lctx.cparams.embeddings) {
-        result = llm.append_pooling(result);
-    }
+    // if (lctx.cparams.embeddings) {
+    //     result = llm.append_pooling(result);
+    // }
+    // 默认开启embedding输出
+    result = llm.append_pooling(result);
 
     llm.free();
 
