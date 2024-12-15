@@ -504,20 +504,9 @@ int main(int argc, char ** argv) {
                     // first generation token
                     parallel_embd = embd[i];
                 }
-                if (n_past != 0) {
-                    // prefill phase
-                    if (llama_decode(ctx, origin_batch)) {
-                        LOG_TEE("%s : failed to eval\n", __func__);
-                        return 1;
-                    }
-                } else {
-                    // decode phase: add batch
-                    llama_batch_add(origin_batch, parallel_embd, n_past + 1, {1}, true);
-                    const int ret = llama_decode(ctx, origin_batch);
-                    if (ret != 0) {
-                        LOG_TEE("%s : parallel decode failed to eval\n", __func__);
-                        return 1;
-                    }
+                if (llama_decode(ctx, origin_batch)) {
+                    LOG_TEE("%s : failed to eval\n", __func__);
+                    return 1;
                 }
 
                 n_past += n_eval;
