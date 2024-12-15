@@ -179,6 +179,7 @@ int main(int argc, char ** argv) {
     int32_t n_total_gen    = 0;
     int32_t n_cache_miss   = 0;
 
+    // TODO 并行解码过程中n_client需要设置成2
     struct llama_kv_cache_view kvc_view = llama_kv_cache_view_init(ctx, n_clients);
 
     const auto t_main_start = ggml_time_us();
@@ -199,7 +200,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        // assign the system KV cache to all parallel sequences
+        // TODO assign the system KV cache to all parallel sequences
         for (int32_t i = 1; i <= n_clients; ++i) {
             llama_kv_cache_seq_cp(ctx, 0, i, -1, -1);
         }
@@ -210,6 +211,7 @@ int main(int argc, char ** argv) {
     LOG_TEE("Processing requests ...\n\n");
 
     while (true) {
+        // 为了调试转储kv
         if (dump_kv_cache) {
             llama_kv_cache_view_update(ctx, &kvc_view);
             llama_kv_cache_dump_view_seqs(kvc_view, 40);
@@ -275,7 +277,7 @@ int main(int argc, char ** argv) {
 
                     LOG_TEE("\033[31mClient %3d, seq %4d, started decoding ...\033[0m\n", client.id, client.seq_id);
 
-                    g_seq_id += 1;
+                    g_seq_id += 1; // 每个客户端都会自增1
 
                     // insert new requests one-by-one
                     //if (cont_batching) {
@@ -285,6 +287,7 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // 批次中没有输入请求时退出推理过程
         if (batch.n_tokens == 0) {
             break;
         }
@@ -293,17 +296,10 @@ int main(int argc, char ** argv) {
         int32_t n_batch = params.n_batch;
 
         for (int32_t i = 0; i < (int32_t) batch.n_tokens; i += n_batch) {
-            // experiment: process in powers of 2
-            //if (i + n_batch > (int32_t) batch.n_tokens && n_batch > 32) {
-            //    n_batch /= 2;
-            //    i -= n_batch;
-            //    continue;
-            //}
-
             const int32_t n_tokens = std::min(n_batch, (int32_t) (batch.n_tokens - i));
 
             llama_batch batch_view = {
-                n_tokens,
+                n_tokens, // 1,
                 batch.token    + i,
                 nullptr,
                 batch.pos      + i,
@@ -338,9 +334,6 @@ int main(int argc, char ** argv) {
                 if (client.i_batch < (int) i || client.i_batch >= (int) (i + n_tokens)) {
                     continue;
                 }
-
-                //printf("client %d, seq %d, token %d, pos %d, batch %d\n",
-                //        client.id, client.seq_id, client.sampled, client.n_decoded, client.i_batch);
 
                 const llama_token id = gpt_sampler_sample(client.smpl, ctx, client.i_batch - i);
 

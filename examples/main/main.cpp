@@ -393,6 +393,7 @@ int main(int argc, char ** argv) {
     display = params.display_prompt;
 
     std::vector<llama_token> embd;
+    llama_token parallel_embd = -1; // 并行解码使用
 
     // tokenized antiprompts
     std::vector<std::vector<llama_token>> antiprompt_ids;
@@ -498,26 +499,39 @@ int main(int argc, char ** argv) {
 
                 LOG("eval: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
 
-                if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
-                    LOG_TEE("%s : failed to eval\n", __func__);
-                    return 1;
+                llama_batch origin_batch = llama_batch_get_one(&embd[i], n_eval, n_past, 0);
+                if (parallel_embd == -1) {
+                    // first generation token
+                    parallel_embd = embd[i];
                 }
-                // if (n_past == 0) {
-                //     // prefill phase: origin calculation type
-                //     if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
-                //         LOG_TEE("%s : failed to eval\n", __func__);
-                //         return 1;
-                //     }
-                // } else {
-                //     LOG("start to decode.\n");
-                //     // decode phase: starting parallel thread
-                //     std::thread origin(llama_decode, ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0));
-                //     std::thread new_thread(llama_decode, ctx, llama_batch_new_one(&embd[i], n_eval, n_past, 0));
-                //
-                //     // 等待两个线程完成
-                //     origin.join();
-                //     new_thread.join();
-                // }
+                if (n_past != 0) {
+                    // prefill phase
+                    if (llama_decode(ctx, origin_batch)) {
+                        LOG_TEE("%s : failed to eval\n", __func__);
+                        return 1;
+                    }
+                } else {
+                    // decode phase: add batch
+                    llama_batch_add(origin_batch, parallel_embd, n_past + 1, {1}, true);
+                    for (int k = 0; k < 2; k++) {
+                        llama_batch batch_view = {
+                            1,
+                            origin_batch.token    + k,
+                            nullptr,
+                            origin_batch.pos      + k,
+                            origin_batch.n_seq_id + k,
+                            origin_batch.seq_id   + k,
+                            origin_batch.logits   + k,
+                            0, 0, 0, // unused
+                        };
+
+                        const int ret = llama_decode(ctx, batch_view);
+                        if (ret != 0) {
+                            LOG_TEE("%s : parallel decode failed to eval\n", __func__);
+                            return 1;
+                        }
+                    }
+                }
 
                 n_past += n_eval;
 
@@ -563,6 +577,14 @@ int main(int argc, char ** argv) {
                     break;
                 }
             }
+        }
+
+        if (parallel_embd != -1) {
+            const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
+
+            gpt_sampler_accept(smpl, id, true);
+
+            parallel_embd = id;
         }
 
         // display text
