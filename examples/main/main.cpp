@@ -272,6 +272,7 @@ int main(int argc, char ** argv) {
     LOG("add_bos: %d\n", add_bos);
 
     std::vector<llama_token> embd_inp;
+    std::vector<llama_token> tokens_list;
 
     {
         // 由于我们不使用对话模式，所以直接读取params.prompt，无需使用模型进行对话模式的解析
@@ -280,6 +281,7 @@ int main(int argc, char ** argv) {
             LOG("tokenize the prompt\n");
             // 转化为llama_token向量
             embd_inp = ::llama_tokenize(ctx, prompt, true, true);
+            tokens_list = ::llama_tokenize(ctx, prompt, true, true);
         }
 
         LOG("prompt: \"%s\"\n", log_tostr(prompt));
@@ -421,6 +423,11 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    std::vector<llama_seq_id> seq_ids(2, 0);
+    for (int32_t i = 0; i < 2; ++i) {
+        seq_ids[i] = i;
+    }
+
     // 如果目标想要生成的token数量n_remain不等于零，就持续生成
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
@@ -499,10 +506,19 @@ int main(int argc, char ** argv) {
                 LOG("eval: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
 
                 llama_batch origin_batch = llama_batch_get_one(&embd[i], n_eval, n_past, 0);
-
-                if (llama_decode(ctx, origin_batch)) {
-                    LOG_TEE("%s : failed to eval\n", __func__);
-                    return 1;
+                if (n_past == 0) {
+                    // prefill: one batch
+                    if (llama_decode(ctx, origin_batch)) {
+                        LOG_TEE("%s : failed to eval\n", __func__);
+                        return 1;
+                    }
+                } else {
+                    // decode: add new batch
+                    // llama_batch_add(origin_batch, tokens_list[n_past],n_past, seq_ids, false);
+                    if (llama_decode(ctx, origin_batch)) {
+                        LOG_TEE("%s : failed to eval\n", __func__);
+                        return 1;
+                    }
                 }
 
                 n_past += n_eval;
@@ -520,9 +536,12 @@ int main(int argc, char ** argv) {
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
             const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
 
+            const llama_token test_id = gpt_sampler_sample(smpl, ctx, 0);
+
             gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
 
             // LOG("last: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, smpl->prev.to_vector()).c_str());
+            LOG("test_embd: %s, %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, test_id).c_str(), LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
 
             embd.push_back(id);
 
