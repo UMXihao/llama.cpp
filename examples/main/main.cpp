@@ -513,12 +513,10 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
                 } else {
-                    LOG("add new batch.\n");
                     llama_batch batch = llama_batch_init(2, 0, 2);
                     // decode: add new batch
                     llama_batch_add(batch, embd[i], n_past, {0}, true);
                     llama_batch_add(batch, tokens_list[n_past], n_past, {1}, true);
-                    LOG("begin to parallel decode.\n");
                     if (llama_decode(ctx, batch)) {
                         LOG_TEE("%s : failed to eval\n", __func__);
                         return 1;
@@ -551,7 +549,7 @@ int main(int argc, char ** argv) {
                 const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
                 const llama_token new_token_id = gpt_sampler_sample(smpl, ctx, 0);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
-
+                gpt_sampler_accept(smpl, new_token_id, /* apply_grammar= */ true);
                 embd.push_back(id);
                 tokens_list.push_back(new_token_id); // share first token
             }
