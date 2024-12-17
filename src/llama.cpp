@@ -14514,7 +14514,7 @@ static int llama_decode_internal(
         // keep last output only
         n_outputs = 1;
     }
-    // parallel decode: logits_all = false
+
     lctx.sbatch.from_batch(batch_all, n_embd,
         /* simple_split */ !kv_self.recurrent,
         /* logits_all   */ n_outputs == n_tokens_all);
@@ -15133,7 +15133,6 @@ static void llama_kv_cache_update_internal(struct llama_context & lctx) {
     if (lctx.model.hparams.rope_type != LLAMA_ROPE_TYPE_NONE && lctx.kv_self.has_shift) {
         if (lctx.model.arch == LLM_ARCH_DEEPSEEK2) { // not supported due to MLA
             GGML_ABORT("Deepseek2 does not support K-shift");
-        }
 
         {
             ggml_backend_sched_reset(lctx.sched);

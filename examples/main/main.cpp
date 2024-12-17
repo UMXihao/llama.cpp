@@ -548,8 +548,8 @@ int main(int argc, char ** argv) {
                 tokens_list.push_back(id); // share first token
                 flag = false;
             } else {
-                const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
-                const llama_token new_token_id = gpt_sampler_sample(new_smpl, ctx, 0);
+                const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
+                const llama_token new_token_id = gpt_sampler_sample(new_smpl, ctx, 1);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
                 gpt_sampler_accept(new_smpl, new_token_id, /* apply_grammar= */ true);
                 embd.push_back(id);
@@ -790,6 +790,8 @@ int main(int argc, char ** argv) {
             is_interacting = true;
         }
     }
+
+    LOG("new_token_sequence: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, tokens_list).c_str());
 
     LOG_TEE("\n");
     gpt_perf_print(ctx, smpl);
