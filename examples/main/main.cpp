@@ -506,19 +506,20 @@ int main(int argc, char ** argv) {
 
                 LOG("eval: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
 
-                llama_batch origin_batch = llama_batch_get_one(&embd[i], n_eval, n_past, 0);
                 if (n_past == 0) {
                     // prefill: one batch
-                    if (llama_decode(ctx, origin_batch)) {
+                    if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
                         LOG_TEE("%s : failed to eval\n", __func__);
                         return 1;
                     }
                 } else {
-                    LOG("add a new batch. token size: %lu, %d\n", tokens_list.size(), n_past);
+                    LOG("add new batch.\n");
+                    llama_batch batch = llama_batch_init(2, 0, 2);
                     // decode: add new batch
-                    llama_batch_add(origin_batch, tokens_list[n_past - 1], n_past, {1}, true);
+                    llama_batch_add(batch, embd[i], n_past, {0}, true);
+                    llama_batch_add(batch, tokens_list[n_past], n_past, {1}, true);
                     LOG("begin to parallel decode.\n");
-                    if (llama_decode(ctx, origin_batch)) {
+                    if (llama_decode(ctx, batch)) {
                         LOG_TEE("%s : failed to eval\n", __func__);
                         return 1;
                     }
