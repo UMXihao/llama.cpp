@@ -790,8 +790,7 @@ int main(int argc, char ** argv) {
             is_interacting = true;
         }
     }
-
-    LOG_TEE("new_token_sequence: %s\n", LOG_NEW_TOKENS_TOSTR_PRETTY(ctx, tokens_list).c_str());
+    LOG("new_token_sequence: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, tokens_list).c_str());
 
     LOG_TEE("\n");
     gpt_perf_print(ctx, smpl);
