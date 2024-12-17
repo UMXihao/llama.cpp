@@ -541,7 +541,7 @@ int main(int argc, char ** argv) {
             gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
 
             // LOG("last: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, smpl->prev.to_vector()).c_str());
-            LOG("test_embd: %s, %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, test_id).c_str(), LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
+            LOG("test_embd: %s", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
 
             embd.push_back(id);
 
