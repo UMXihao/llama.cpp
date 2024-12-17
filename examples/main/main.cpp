@@ -516,7 +516,6 @@ int main(int argc, char ** argv) {
                 } else {
                     LOG("add a new batch.\n");
                     // decode: add new batch
-                    llama_batch_add(origin_batch, embd[i],n_past, {0}, true);
                     llama_batch_add(origin_batch, tokens_list[n_past],n_past, {1}, true);
                     LOG("begin to parallel decode.\n");
                     if (llama_decode(ctx, origin_batch)) {
