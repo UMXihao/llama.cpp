@@ -656,6 +656,35 @@ inline std::string LOG_TOKENS_TOSTR_PRETTY(const C & ctx, const T & tokens)
     return buf.str();
 }
 
+template <typename C, typename T>
+inline std::string LOG_NEW_TOKENS_TOSTR_PRETTY(const C & ctx, const T & tokens)
+{
+    std::stringstream buf;
+
+    bool first = true;
+    for (const auto & token : tokens)
+    {
+        if (!first) {
+            buf << " ";
+        } else {
+            first = false;
+        }
+
+        auto detokenized = llama_token_to_piece(ctx, token);
+
+        detokenized.erase(
+            std::remove_if(
+                detokenized.begin(),
+                detokenized.end(),
+                [](const unsigned char c) { return !std::isprint(c); }),
+            detokenized.end());
+
+        buf << detokenized;
+    }
+
+    return buf.str();
+}
+
 template <typename C, typename B>
 inline std::string LOG_BATCH_TOSTR_PRETTY(const C & ctx, const B & batch)
 {
