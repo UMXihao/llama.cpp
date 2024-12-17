@@ -18454,7 +18454,7 @@ void llama_synchronize(struct llama_context * ctx) {
     // this should only happen when using batch size 1 to evaluate a batch
 
     // add the evaluation to the stats
-    if (ctx->n_queued_tokens == 1) {
+    if (ctx->n_queued_tokens == 1 || ctx->sbatch.n_tokens) {
         ctx->t_eval_us += ggml_time_us() - ctx->t_compute_start_us;
         ctx->n_eval++;
     } else if (ctx->n_queued_tokens > 1) {

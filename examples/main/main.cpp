@@ -791,8 +791,11 @@ int main(int argc, char ** argv) {
         }
     }
 
-    LOG("new_token_sequence: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, tokens_list).c_str());
-
+    LOG_TEE("new_token_sequence: \n");
+    for (size_t i = 0; i < tokens_list.size(); i++) {
+        const llama_token token = tokens_list[i];
+        LOG_TEE("%s", llama_token_to_piece(ctx, token).c_str());
+    }
     LOG_TEE("\n");
     gpt_perf_print(ctx, smpl);
     write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
