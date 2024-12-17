@@ -514,7 +514,9 @@ int main(int argc, char ** argv) {
                     }
                 } else {
                     // decode: add new batch
-                    // llama_batch_add(origin_batch, tokens_list[n_past],n_past, seq_ids, false);
+                    llama_batch_add(origin_batch, tokens_list[n_past],n_past, seq_ids, false);
+                    origin_batch.logits[origin_batch.n_tokens - 1] = true;
+
                     if (llama_decode(ctx, origin_batch)) {
                         LOG_TEE("%s : failed to eval\n", __func__);
                         return 1;
@@ -540,8 +542,7 @@ int main(int argc, char ** argv) {
 
             gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
 
-            // LOG("last: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, smpl->prev.to_vector()).c_str());
-            LOG("test_embd: %s", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
+            LOG("token id: %d, test: %d\n", n_remain, test_id);
 
             embd.push_back(id);
 
