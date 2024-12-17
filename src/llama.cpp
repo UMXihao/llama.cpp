@@ -14600,8 +14600,7 @@ static int llama_decode_internal(
             // no output
             res = nullptr;
             embd = nullptr;
-        } else {
-            // TODO 默认输出句子的embedding
+        } else if (cparams.embeddings) {
             res = nullptr; // do not extract logits for embedding case
             embd = nullptr;
             for (int i = gf->n_nodes - 1; i >= 0; --i) {
@@ -14611,6 +14610,9 @@ static int llama_decode_internal(
                 }
             }
             GGML_ASSERT(embd != nullptr && "missing embeddings tensor");
+        } else {
+            embd = nullptr; // do not extract embeddings when not needed
+            GGML_ASSERT(strcmp(res->name, "result_output") == 0 && "missing result_output tensor");
         }
 
         // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
