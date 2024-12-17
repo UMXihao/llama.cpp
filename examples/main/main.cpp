@@ -514,9 +514,11 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
                 } else {
+                    LOG("add a new batch.\n");
                     // decode: add new batch
-                    llama_batch_add(origin_batch, tokens_list[n_past],n_past, seq_ids, true);
-
+                    llama_batch_add(origin_batch, embd[i],n_past, {0}, true);
+                    llama_batch_add(origin_batch, tokens_list[n_past],n_past, {1}, true);
+                    LOG("begin to parallel decode.\n");
                     if (llama_decode(ctx, origin_batch)) {
                         LOG_TEE("%s : failed to eval\n", __func__);
                         return 1;
