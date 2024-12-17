@@ -428,6 +428,7 @@ int main(int argc, char ** argv) {
         seq_ids[i] = i;
     }
 
+    bool flag = true; // whether is the first token
     // 如果目标想要生成的token数量n_remain不等于零，就持续生成
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
@@ -514,8 +515,7 @@ int main(int argc, char ** argv) {
                     }
                 } else {
                     // decode: add new batch
-                    llama_batch_add(origin_batch, tokens_list[n_past],n_past, seq_ids, false);
-                    origin_batch.logits[origin_batch.n_tokens - 1] = true;
+                    llama_batch_add(origin_batch, tokens_list[n_past],n_past, seq_ids, true);
 
                     if (llama_decode(ctx, origin_batch)) {
                         LOG_TEE("%s : failed to eval\n", __func__);
@@ -536,15 +536,23 @@ int main(int argc, char ** argv) {
         embd.clear();
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
-            const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
+            // share first token
+            if (flag) {
+                const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
 
-            const llama_token test_id = gpt_sampler_sample(smpl, ctx, 0);
+                gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
 
-            gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
+                embd.push_back(id);
+                tokens_list.push_back(id); // share first token
+                flag = false;
+            } else {
+                const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
+                const llama_token new_token_id = gpt_sampler_sample(smpl, ctx, 0);
+                gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
 
-            LOG("token id: %d, test: %d\n", n_remain, test_id);
-
-            embd.push_back(id);
+                embd.push_back(id);
+                tokens_list.push_back(new_token_id); // share first token
+            }
 
             // echo this to console
             input_echo = true;
