@@ -199,6 +199,7 @@ int main(int argc, char ** argv) {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     gpt_sampler * smpl = nullptr;
+    gpt_sampler * new_smpl = nullptr;
 
     std::vector<llama_chat_msg> chat_msgs;
 
@@ -352,6 +353,7 @@ int main(int argc, char ** argv) {
     }
 
     smpl = gpt_sampler_init(model, sparams);
+    new_smpl = gpt_sampler_init(model, sparams);
     if (!smpl) {
         fprintf(stderr, "%s: failed to initialize sampling subsystem\n", __func__);
         exit(1);
@@ -547,9 +549,9 @@ int main(int argc, char ** argv) {
                 flag = false;
             } else {
                 const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
-                const llama_token new_token_id = gpt_sampler_sample(smpl, ctx, 0);
+                const llama_token new_token_id = gpt_sampler_sample(new_smpl, ctx, 0);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
-                gpt_sampler_accept(smpl, new_token_id, /* apply_grammar= */ true);
+                gpt_sampler_accept(new_smpl, new_token_id, /* apply_grammar= */ true);
                 embd.push_back(id);
                 tokens_list.push_back(new_token_id); // share first token
             }

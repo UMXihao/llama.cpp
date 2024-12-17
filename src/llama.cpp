@@ -14458,7 +14458,7 @@ static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch_all) { // TODO: rename back to bat
     lctx.is_encoding = false; // 是否是编码模式
-    const uint32_t n_tokens_all = batch_all.n_tokens; // 输入token的数量，decode阶段为1
+    const uint32_t n_tokens_all = batch_all.n_tokens; // parallel decode: n_token = 2
 
     if (n_tokens_all == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0", __func__);
@@ -14514,7 +14514,7 @@ static int llama_decode_internal(
         // keep last output only
         n_outputs = 1;
     }
-    // 类型判断，完成sequence-batch转换
+    // parallel decode: logits_all = false
     lctx.sbatch.from_batch(batch_all, n_embd,
         /* simple_split */ !kv_self.recurrent,
         /* logits_all   */ n_outputs == n_tokens_all);
