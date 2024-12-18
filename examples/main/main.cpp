@@ -603,7 +603,7 @@ int main(int argc, char ** argv) {
         }
 
         // if not currently processing queued inputs;
-        if ((int) embd_inp.size() < n_consumed) {
+        if ((int) embd.size() < n_consumed) {
             // check for reverse prompt in the last n_prev tokens
             if (!params.antiprompt.empty()) {
                 const int n_prev = 1;
