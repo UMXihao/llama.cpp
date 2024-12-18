@@ -108,6 +108,7 @@ int main(int argc, char ** argv) {
     const int n_ctx_train = llama_n_ctx_train(model);
     const int n_ctx = llama_n_ctx(ctx);
 
+    // LLAMA_POOLING_TYPE_MEAN = 1
     const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
 
     if (llama_model_has_encoder(model) && llama_model_has_decoder(model)) {
@@ -182,7 +183,7 @@ int main(int argc, char ** argv) {
 
     // allocate output
     const int n_embd = llama_n_embd(model);
-    std::vector<float> embeddings(n_embd_count * n_embd, 0);
+    std::vector<float> embeddings(n_embd_count * n_embd, 0); // 定义嵌入向量是4096维度
     float * emb = embeddings.data();
 
     // break into batches
