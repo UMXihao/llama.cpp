@@ -611,10 +611,10 @@ int main(int argc, char ** argv) {
         }
 
         // if not currently processing queued inputs;
-        if ((int) embd_inp.size() <= n_consumed) {
+        if ((int) embd_inp.size() < n_consumed) {
             // check for reverse prompt in the last n_prev tokens
             if (!params.antiprompt.empty()) {
-                const int n_prev = 32;
+                const int n_prev = 1;
                 const std::string last_output = gpt_sampler_prev_str(smpl, ctx, n_prev);
 
                 is_antiprompt = false;
@@ -677,96 +677,6 @@ int main(int argc, char ** argv) {
             if (params.conversation) {
                 const auto id = gpt_sampler_last(smpl);
                 assistant_ss << llama_token_to_piece(ctx, id, false);
-            }
-
-            if (n_past > 0 && is_interacting) {
-                LOG("waiting for user input\n");
-
-                if (params.conversation) {
-                    printf("\n> ");
-                }
-
-                if (params.input_prefix_bos) {
-                    LOG("adding input prefix BOS token\n");
-                    embd_inp.push_back(llama_token_bos(model));
-                }
-
-                std::string buffer;
-                if (!params.input_prefix.empty() && !params.conversation) {
-                    LOG("appending input prefix: '%s'\n", params.input_prefix.c_str());
-                    printf("%s", params.input_prefix.c_str());
-                }
-
-                // color user input only
-                console::set_display(console::user_input);
-                display = params.display_prompt;
-
-                std::string line;
-                bool another_line = true;
-                do {
-                    another_line = console::readline(line, params.multiline_input);
-                    buffer += line;
-                } while (another_line);
-
-                // done taking input, reset color
-                console::set_display(console::reset);
-                display = true;
-
-                // Add tokens to embd only if the input buffer is non-empty
-                // Entering a empty line lets the user pass control back
-                if (buffer.length() > 1) {
-                    // append input suffix if any
-                    if (!params.input_suffix.empty() && !params.conversation) {
-                        LOG("appending input suffix: '%s'\n", params.input_suffix.c_str());
-                        printf("%s", params.input_suffix.c_str());
-                    }
-
-                    LOG("buffer: '%s'\n", buffer.c_str());
-
-                    const size_t original_size = embd_inp.size();
-
-                    if (params.escape) {
-                        string_process_escapes(buffer);
-                    }
-
-                    bool format_chat = params.conversation && params.enable_chat_template;
-                    std::string user_inp = format_chat
-                        ? chat_add_and_format(model, chat_msgs, "user", std::move(buffer))
-                        : std::move(buffer);
-                    // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)
-                    const auto line_pfx = ::llama_tokenize(ctx, params.input_prefix, false, true);
-                    const auto line_inp = ::llama_tokenize(ctx, user_inp,            false, format_chat);
-                    const auto line_sfx = ::llama_tokenize(ctx, params.input_suffix, false, true);
-
-                    LOG("input tokens: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, line_inp).c_str());
-
-                    // if user stop generation mid-way, we must add EOT to finish model's last response
-                    if (need_insert_eot && format_chat) {
-                        llama_token eot = llama_token_eot(model);
-                        embd_inp.push_back(eot == -1 ? llama_token_eos(model) : eot);
-                        need_insert_eot = false;
-                    }
-
-                    embd_inp.insert(embd_inp.end(), line_pfx.begin(), line_pfx.end());
-                    embd_inp.insert(embd_inp.end(), line_inp.begin(), line_inp.end());
-                    embd_inp.insert(embd_inp.end(), line_sfx.begin(), line_sfx.end());
-
-                    for (size_t i = original_size; i < embd_inp.size(); ++i) {
-                        const llama_token token = embd_inp[i];
-                        output_tokens.push_back(token);
-                        output_ss << llama_token_to_piece(ctx, token);
-                    }
-
-                    // reset assistant message
-                    assistant_ss.str("");
-
-                    n_remain -= line_inp.size();
-                    LOG("n_remain: %d\n", n_remain);
-                } else {
-                    LOG("empty line, passing control back\n");
-                }
-
-                input_echo = false; // do not echo this again
             }
 
             if (n_past > 0) {
