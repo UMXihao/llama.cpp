@@ -541,7 +541,7 @@ int main(int argc, char ** argv) {
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
             // share first token
             if (flag) {
-                const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
+                const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
                 // share first token
                 embd.push_back(id);
