@@ -264,7 +264,6 @@ int main(int argc, char ** argv) {
     LOG("add_bos: %d\n", add_bos);
 
     std::vector<llama_token> embd_inp;
-    std::vector<llama_token> tokens_list;
 
     {
         // 由于我们不使用对话模式，所以直接读取params.prompt，无需使用模型进行对话模式的解析
@@ -428,6 +427,10 @@ int main(int argc, char ** argv) {
     // llama_decode will output logits only for the last token of the prompt
     batch.logits[batch.n_tokens - 1] = true;
 
+    llama_token new_token_id;
+    std::string origin;
+    std::string parallel;
+
     bool flag = true; // whether is the first token
     // 如果目标想要生成的token数量n_remain不等于零，就持续生成
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
@@ -516,7 +519,7 @@ int main(int argc, char ** argv) {
                     llama_batch_clear(batch);
                     // decode: add new batch
                     llama_batch_add(batch, embd[i], n_past, {0}, true);
-                    llama_batch_add(batch, tokens_list[n_past - embd_inp.size()], n_past, {1}, true);
+                    llama_batch_add(batch, new_token_id, n_past, {1}, true);
                     if (llama_decode(ctx, batch)) {
                         LOG_TEE("%s : failed to eval\n", __func__);
                         return 1;
@@ -540,16 +543,21 @@ int main(int argc, char ** argv) {
             if (flag) {
                 const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
+                // share first token
                 embd.push_back(id);
-                tokens_list.push_back(id); // share first token
+                origin += llama_token_to_piece(ctx, id);
+                parallel += llama_token_to_piece(ctx, id);
                 flag = false;
             } else {
+                // origin output
                 const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
                 embd.push_back(id);
-                const llama_token new_token_id = gpt_sampler_sample(smpl, ctx, 1);
+                origin += llama_token_to_piece(ctx, id);
+                // parallel output
+                new_token_id = gpt_sampler_sample(smpl, ctx, 1);
                 gpt_sampler_accept(smpl, new_token_id, /* apply_grammar= */ true);
-                tokens_list.push_back(new_token_id); // share first token
+                parallel += llama_token_to_piece(ctx, new_token_id);
             }
 
             // echo this to console
@@ -697,11 +705,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    LOG_TEE("\n");
-    for (auto & token : tokens_list) {
-        LOG_TEE("%s", llama_token_to_piece(ctx, token).c_str());
-    }
-    LOG_TEE("\n");
+    LOG_TEE("\n%s\n", parallel);
+
     gpt_perf_print(ctx, smpl);
     write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
 
