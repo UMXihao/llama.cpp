@@ -692,8 +692,11 @@ int main(int argc, char ** argv) {
             is_interacting = true;
         }
     }
-    LOG("new_token_sequence: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, tokens_list).c_str());
 
+    LOG_TEE("\n");
+    for (auto & token : tokens_list) {
+        LOG_TEE("%s", llama_token_to_piece(ctx, token).c_str());
+    }
     LOG_TEE("\n");
     gpt_perf_print(ctx, smpl);
     write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
