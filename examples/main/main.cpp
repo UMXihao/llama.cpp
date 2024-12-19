@@ -191,7 +191,6 @@ int main(int argc, char ** argv) {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     gpt_sampler * smpl = nullptr;
-    gpt_sampler * new_smpl = nullptr;
 
     std::vector<llama_chat_msg> chat_msgs;
 
@@ -344,7 +343,6 @@ int main(int argc, char ** argv) {
     }
 
     smpl = gpt_sampler_init(model, sparams);
-    new_smpl = gpt_sampler_init(model, sparams);
     if (!smpl) {
         fprintf(stderr, "%s: failed to initialize sampling subsystem\n", __func__);
         exit(1);
@@ -416,10 +414,19 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
-    std::vector<llama_seq_id> seq_ids(2, 0);
-    for (int32_t i = 0; i < 2; ++i) {
-        seq_ids[i] = i;
+    // parallel decode for consistancy
+    llama_batch batch = llama_batch_init(std::max(embd_inp.size(), (size_t) 2), 0, 2);
+
+    std::vector<llama_seq_id> seq_ids= {0, 1};
+
+    for (size_t i = 0; i < embd_inp.size(); ++i) {
+        llama_batch_add(batch, embd_inp[i], i, seq_ids, false);
     }
+
+    GGML_ASSERT(batch.n_tokens == (int) embd_inp.size());
+
+    // llama_decode will output logits only for the last token of the prompt
+    batch.logits[batch.n_tokens - 1] = true;
 
     bool flag = true; // whether is the first token
     // 如果目标想要生成的token数量n_remain不等于零，就持续生成
@@ -501,12 +508,12 @@ int main(int argc, char ** argv) {
 
                 if (n_past == 0) {
                     // prefill: one batch
-                    if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
+                    if (llama_decode(ctx, batch)) {
                         LOG_TEE("%s : failed to eval\n", __func__);
                         return 1;
                     }
                 } else {
-                    llama_batch batch = llama_batch_init(2, 0, 2);
+                    llama_batch_clear(batch);
                     // decode: add new batch
                     llama_batch_add(batch, embd[i], n_past, {0}, true);
                     llama_batch_add(batch, tokens_list[n_past - embd_inp.size()], n_past, {1}, true);
@@ -531,19 +538,17 @@ int main(int argc, char ** argv) {
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
             // share first token
             if (flag) {
-                const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
-
+                const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
-
                 embd.push_back(id);
                 tokens_list.push_back(id); // share first token
                 flag = false;
             } else {
                 const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
-                const llama_token new_token_id = gpt_sampler_sample(new_smpl, ctx, 1);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
-                gpt_sampler_accept(new_smpl, new_token_id, /* apply_grammar= */ true);
                 embd.push_back(id);
+                const llama_token new_token_id = gpt_sampler_sample(smpl, ctx, 1);
+                gpt_sampler_accept(smpl, new_token_id, /* apply_grammar= */ true);
                 tokens_list.push_back(new_token_id); // share first token
             }
 
