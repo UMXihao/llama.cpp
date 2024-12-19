@@ -274,7 +274,6 @@ int main(int argc, char ** argv) {
             LOG("tokenize the prompt\n");
             // 转化为llama_token向量
             embd_inp = ::llama_tokenize(ctx, prompt, true, true);
-            tokens_list = ::llama_tokenize(ctx, prompt, true, true);
         }
 
         LOG("prompt: \"%s\"\n", log_tostr(prompt));
@@ -510,7 +509,7 @@ int main(int argc, char ** argv) {
                     llama_batch batch = llama_batch_init(2, 0, 2);
                     // decode: add new batch
                     llama_batch_add(batch, embd[i], n_past, {0}, true);
-                    llama_batch_add(batch, tokens_list[n_past], n_past, {1}, true);
+                    llama_batch_add(batch, tokens_list[n_past - embd_inp.size()], n_past, {1}, true);
                     if (llama_decode(ctx, batch)) {
                         LOG_TEE("%s : failed to eval\n", __func__);
                         return 1;
