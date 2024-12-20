@@ -545,6 +545,7 @@ int main(int argc, char ** argv) {
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
                 // share first token
                 embd.push_back(id);
+
                 origin += llama_token_to_piece(ctx, id);
                 parallel += llama_token_to_piece(ctx, id);
                 flag = false;
@@ -705,7 +706,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    LOG_TEE("\n%s\n", parallel);
+    LOG_TEE("\n%s\n", parallel.c_str());
 
     gpt_perf_print(ctx, smpl);
     write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
