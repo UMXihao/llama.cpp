@@ -544,9 +544,13 @@ int main(int argc, char ** argv) {
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
                 embd.push_back(id);
                 tokens_list.push_back(id); // share first token
-                origin += llama_token_to_piece(ctx, id);
-                parallel += llama_token_to_piece(ctx, id);
+                std::string temp_str = llama_token_to_piece(ctx, id);
+                origin += temp_str;
+                parallel += temp_str;
                 flag = false;
+                if (temp_str.find('\n') != std::string::npos) {
+                    is_antiprompt = true;
+                }
             } else {
                 const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
@@ -554,8 +558,13 @@ int main(int argc, char ** argv) {
                 const llama_token new_token_id = gpt_sampler_sample(smpl, ctx, 1);
                 gpt_sampler_accept(smpl, new_token_id, /* apply_grammar= */ true);
                 tokens_list.push_back(new_token_id); // share first token
-                origin += llama_token_to_piece(ctx, id);
-                parallel += llama_token_to_piece(ctx, new_token_id);
+                std::string origin_str = llama_token_to_piece(ctx, id);
+                std::string parallel_str = llama_token_to_piece(ctx, id);
+                origin += origin_str;
+                parallel += parallel_str;
+                if (origin_str.find('\n') != std::string::npos || parallel_str.find('\n') != std::string::npos) {
+                    is_antiprompt = true;
+                }
             }
 
             // echo this to console
@@ -616,7 +625,7 @@ int main(int argc, char ** argv) {
         if ((int) embd.size() < n_consumed) {
             // check for reverse prompt in the last n_prev tokens
             if (!params.antiprompt.empty()) {
-                const int n_prev = 1;
+                const int n_prev = 32;
                 const std::string last_output = gpt_sampler_prev_str(smpl, ctx, n_prev);
 
                 is_antiprompt = false;
