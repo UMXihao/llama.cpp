@@ -559,7 +559,7 @@ int main(int argc, char ** argv) {
                 gpt_sampler_accept(smpl, new_token_id, /* apply_grammar= */ true);
                 tokens_list.push_back(new_token_id); // share first token
                 std::string origin_str = llama_token_to_piece(ctx, id);
-                std::string parallel_str = llama_token_to_piece(ctx, id);
+                std::string parallel_str = llama_token_to_piece(ctx, new_token_id);
                 origin += origin_str;
                 parallel += parallel_str;
                 if (origin_str.find('\n') != std::string::npos || parallel_str.find('\n') != std::string::npos) {
