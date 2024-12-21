@@ -136,6 +136,60 @@ static std::string chat_add_and_format(struct llama_model * model, std::vector<l
     return formatted;
 }
 
+static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & tokens, llama_seq_id seq_id) {
+    size_t n_tokens = tokens.size();
+    for (size_t i = 0; i < n_tokens; i++) {
+        llama_batch_add(batch, tokens[i], i, { seq_id }, true);
+    }
+}
+
+static void batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd, int embd_norm) {
+    const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
+    const struct llama_model * model = llama_get_model(ctx);
+
+    // clear previous kv_cache values (irrelevant for embeddings)
+    llama_kv_cache_clear(ctx);
+
+    // run model
+    fprintf(stderr, "%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
+    if (llama_model_has_encoder(model) && !llama_model_has_decoder(model)) {
+        // encoder-only model
+        if (llama_encode(ctx, batch) < 0) {
+            fprintf(stderr, "%s : failed to encode\n", __func__);
+        }
+    } else if (!llama_model_has_encoder(model) && llama_model_has_decoder(model)) {
+        // decoder-only model
+        if (llama_decode(ctx, batch) < 0) {
+            fprintf(stderr, "%s : failed to decode\n", __func__);
+        }
+    }
+
+    for (int i = 0; i < batch.n_tokens; i++) {
+        if (!batch.logits[i]) {
+            continue;
+        }
+
+        const float * embd = nullptr;
+        int embd_pos = 0;
+
+        if (pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            // try to get token embeddings
+            embd = llama_get_embeddings_ith(ctx, i);
+            embd_pos = i;
+            GGML_ASSERT(embd != NULL && "failed to get token embeddings");
+        } else {
+            // try to get sequence embeddings - supported only when pooling_type is not NONE
+            embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
+            embd_pos = batch.seq_id[i][0];
+            GGML_ASSERT(embd != NULL && "failed to get sequence embeddings");
+        }
+
+        float * out = output + embd_pos * n_embd;
+        llama_embd_normalize(embd, out, n_embd, embd_norm);
+    }
+}
+
+
 int main(int argc, char ** argv) {
     gpt_params params;
     g_params = &params;
@@ -264,6 +318,7 @@ int main(int argc, char ** argv) {
     LOG("add_bos: %d\n", add_bos);
 
     std::vector<llama_token> embd_inp;
+    std::vector<llama_token> origin_token;
     std::vector<llama_token> tokens_list;
     {
         // 由于我们不使用对话模式，所以直接读取params.prompt，无需使用模型进行对话模式的解析
@@ -427,9 +482,6 @@ int main(int argc, char ** argv) {
     // llama_decode will output logits only for the last token of the prompt
     batch.logits[batch.n_tokens - 1] = true;
 
-    std::string origin;
-    std::string parallel;
-
     bool flag = true; // whether is the first token
     // 如果目标想要生成的token数量n_remain不等于零，就持续生成
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
@@ -545,8 +597,6 @@ int main(int argc, char ** argv) {
                 embd.push_back(id);
                 tokens_list.push_back(id); // share first token
                 std::string temp_str = llama_token_to_piece(ctx, id);
-                origin += temp_str;
-                parallel += temp_str;
                 flag = false;
                 if (temp_str.find('\n') != std::string::npos) {
                     is_antiprompt = true;
@@ -560,8 +610,6 @@ int main(int argc, char ** argv) {
                 tokens_list.push_back(new_token_id); // share first token
                 std::string origin_str = llama_token_to_piece(ctx, id);
                 std::string parallel_str = llama_token_to_piece(ctx, new_token_id);
-                origin += origin_str;
-                parallel += parallel_str;
                 if (origin_str.find('\n') != std::string::npos || parallel_str.find('\n') != std::string::npos) {
                     is_antiprompt = true;
                 }
@@ -712,7 +760,57 @@ int main(int argc, char ** argv) {
         }
     }
 
-    LOG_TEE("\n**********\n%s\n", parallel.c_str());
+    // begin to embed, input should be token id
+    params.embedding = true;
+    params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+
+    const int n_prompts = 2;
+    struct llama_batch embedding_batch = llama_batch_init(params.n_batch, 0, 1);
+
+    // count number of embeddings
+    int n_embd_count = n_prompts;
+
+    // allocate output
+    const int n_embd = llama_n_embd(model);
+    std::vector<float> embeddings(n_embd_count * n_embd, 0); // 定义嵌入向量是4096维度
+    float * emb = embeddings.data();
+
+    // tokenize the prompts and trim
+    std::vector<std::vector<int32_t>> inputs;
+    inputs.push_back(origin_token);
+    inputs.push_back(tokens_list);
+
+    // break into batches
+    int e = 0; // number of embeddings already stored
+    int s = 0; // number of prompts in current batch
+    for (int k = 0; k < n_prompts; k++) {
+        // clamp to n_batch tokens
+        auto & inp = inputs[k];
+
+        const uint64_t n_toks = inp.size();
+
+        // encode if at capacity
+        if (embedding_batch.n_tokens + n_toks > params.n_batch) {
+            float * out = emb + e * n_embd;
+            batch_decode(ctx, embedding_batch, out, s, n_embd, params.embd_normalize);
+            e += s;
+            s = 0;
+            llama_batch_clear(embedding_batch);
+        }
+
+        // add to batch
+        batch_add_seq(embedding_batch, inp, s);
+        s += 1;
+    }
+
+    // final batch
+    float * out = emb + e * n_embd;
+    batch_decode(ctx, embedding_batch, out, s, n_embd, params.embd_normalize);
+
+
+    // similarity
+    float sim = llama_embd_similarity_cos(emb + 0, emb + n_embd, n_embd);
+    LOG_TEE("\nsim: %f\n", sim);
 
     gpt_perf_print(ctx, smpl);
     write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
