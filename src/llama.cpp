@@ -18445,6 +18445,11 @@ int32_t llama_decode(
     return ret;
 }
 
+void llama_embedding(struct llama_context * ctx) {
+    ctx->cparams.embeddings = true;
+    ctx->cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+}
+
 void llama_synchronize(struct llama_context * ctx) {
     ggml_backend_sched_synchronize(ctx->sched);
 

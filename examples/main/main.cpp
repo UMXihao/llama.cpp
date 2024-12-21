@@ -763,6 +763,7 @@ int main(int argc, char ** argv) {
     // begin to embed, input should be token id
     params.embedding = true;
     params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+    llama_embedding(ctx);
 
     const int n_prompts = 2;
     struct llama_batch embedding_batch = llama_batch_init(params.n_batch, 0, 1);
