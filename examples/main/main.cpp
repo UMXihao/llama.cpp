@@ -595,6 +595,7 @@ int main(int argc, char ** argv) {
                 const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
                 embd.push_back(id);
+                origin_token.push_back(id);
                 tokens_list.push_back(id); // share first token
                 std::string temp_str = llama_token_to_piece(ctx, id);
                 flag = false;
@@ -605,6 +606,7 @@ int main(int argc, char ** argv) {
                 const llama_token id = gpt_sampler_sample(smpl, ctx, 0);
                 gpt_sampler_accept(smpl, id, /* apply_grammar= */ true);
                 embd.push_back(id);
+                origin_token.push_back(id);
                 const llama_token new_token_id = gpt_sampler_sample(smpl, ctx, 1);
                 gpt_sampler_accept(smpl, new_token_id, /* apply_grammar= */ true);
                 tokens_list.push_back(new_token_id); // share first token
