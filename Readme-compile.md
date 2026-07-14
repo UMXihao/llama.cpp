@@ -1,0 +1,93 @@
+# cmake build
+```shell
+export ANDROID_NDK_ROOT=/home/lili-5090/Sean/Hexagon_SDK/6.4.0.2/tools/android-ndk-r25c
+
+export OPENCL_SDK_ROOT=/home/lili-5090/Sean/Hexagon_SDK/6.4.0.2/tools/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android
+export HEXAGON_SDK_ROOT=/home/lili-5090/Sean/Hexagon_SDK/6.4.0.2/
+export HEXAGON_TOOLS_ROOT=/home/lili-5090/Sean/Hexagon_SDK/6.4.0.2/tools/HEXAGON_Tools/19.0.04/
+
+cmake \
+-DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
+-DANDROID_ABI=arm64-v8a \
+-DANDROID_PLATFORM=android-31 \
+-DCMAKE_C_FLAGS="-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
+-DCMAKE_CXX_FLAGS="-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
+-DHEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT \
+-DHEXAGON_TOOLS_ROOT=$HEXAGON_TOOLS_ROOT \
+-DPREBUILT_LIB_DIR=android_aarch64 \
+-DGGML_OPENMP=OFF \
+-DGGML_LLAMAFILE=OFF \
+-DGGML_OPENCL=ON \
+-DGGML_HEXAGON=ON \
+-DGGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE=128 \
+-DLLAMA_OPENSSL=OFF \
+-B build-snapdragon
+
+#-DCMAKE_PREFIX_PATH=$OPENCL_SDK_ROOT \ 
+
+#"ANDROID_ABI":      "arm64-v8a",
+#"ANDROID_PLATFORM": "android-31",
+#"CMAKE_TOOLCHAIN_FILE": "$env{ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake",
+#"CMAKE_C_FLAGS":   "-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE",
+#"CMAKE_CXX_FLAGS": "-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE",
+#"CMAKE_C_FLAGS_RELEASE":          "-O3 -DNDEBUG",
+#"CMAKE_CXX_FLAGS_RELEASE":        "-O3 -DNDEBUG",
+#"CMAKE_C_FLAGS_RELWITHDEBINFO":   "-O3 -DNDEBUG -g",
+#"CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O3 -DNDEBUG -g",
+#"CMAKE_PREFIX_PATH":  "$env{OPENCL_SDK_ROOT}",
+#"HEXAGON_SDK_ROOT":   "$env{HEXAGON_SDK_ROOT}",
+#"HEXAGON_TOOLS_ROOT": "$env{HEXAGON_TOOLS_ROOT}",
+#"PREBUILT_LIB_DIR": "android_aarch64",
+#"GGML_OPENMP":      "OFF",
+#"GGML_LLAMAFILE":   "OFF",
+#"GGML_OPENCL":      "ON",
+#"GGML_HEXAGON":     "ON",
+#"GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE": "128",
+#"LLAMA_OPENSSL":    "OFF"
+
+cmake --build build-snapdragon --config Release -j 22
+
+```
+
+# Compile error
+/home/lili-5090/Sean/llama.cpp/tools/server/server-http.h:72:18: error: no template named 'unordered_map' in namespace 'std' mutable std::unordered_map<std::string, handler_t> handlers;
+
+server-http.h add header file.
+++ #include <unordered_map>
+
+```shell
+mkdir snapdragon
+cmake --install build-snapdragon --prefix snapdragon/ --config Release
+
+adb push snapdragon/ /data/local/tmp/
+```
+
+# How to Run
+```shell
+adb shell
+cd /data/local/tmp/snapdragon/
+# M=Llama-3.2-1B-Instruct-Q4_0.gguf D=HTP0 ./scripts/snapdragon/adb/run-cli.sh -no-cnv -p "what is the most popular cookie in the world?"
+
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/llama-3.2-3b-instruct.q8_0.gguf \
+--poll 1000 -t 6 --cpu-mask 0xfc --cpu-strict 1 \
+--ctx-size 8192 --batch-size 128 -ctk q8_0 -ctv q8_0 -fa on \
+-ngl 99 --device HTP0 -no-cnv -p "what is the most popular cookie in the world?"
+
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/llama-3.2-3b-instruct.q8_0.gguf \
+--poll 1000 -t 6 --cpu-mask 0xfc --cpu-strict 1 \
+--ctx-size 8192 --batch-size 128 -ctk q8_0 -ctv q8_0 -fa on \
+-ngl 99 --device HTP0 -no-cnv -f ../models/fix-token.txt --no-display-prompt
+
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/llama-3.2-3b-instruct.q8_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on \
+-ngl 99 --device HTP0 -f ../models/fix-token.txt --no-display-prompt
+
+# compare with gpu
+LD_LIBRARY_PATH=lib ./bin/llama-cli -m ../models/llama-3.2-3b-instruct.q8_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on \
+-ngl 99 -p "what is the most popular cookie in the world?"
+
+LD_LIBRARY_PATH=lib ./bin/llama-cli -m ../models/llama-3.2-3b-instruct.q8_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on \
+-ngl 99 -f ../models/fix-token.txt --no-display-prompt
+```
