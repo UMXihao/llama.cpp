@@ -83,11 +83,27 @@ LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models
 -ngl 99 --device HTP0 -f ../models/fix-token.txt --no-display-prompt
 
 # compare with gpu
-LD_LIBRARY_PATH=lib ./bin/llama-cli -m ../models/llama-3.2-3b-instruct.q8_0.gguf \
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/llama-3.2-3b-instruct.q8_0.gguf \
 --ctx-size 8192 --batch-size 128 -fa on \
--ngl 99 -p "what is the most popular cookie in the world?"
+-ngl 99 --device GPUOpenCL -f ../models/fix-token.txt --no-display-prompt
+```
 
-LD_LIBRARY_PATH=lib ./bin/llama-cli -m ../models/llama-3.2-3b-instruct.q8_0.gguf \
+# How to Run MoE
+```shell
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
 --ctx-size 8192 --batch-size 128 -fa on \
--ngl 99 -f ../models/fix-token.txt --no-display-prompt
+-ngl 99 --device HTP0 -f ../models/fix-token.txt --no-display-prompt
+
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/granite-3.0-1b-a400m-instruct-Q8_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on \
+-ngl 99 --device HTP0 -f ../models/fix-token.txt --no-display-prompt
+
+# compare with gpu
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on \
+-ngl 99 --device GPUOpenCL -f ../models/fix-token.txt --no-display-prompt
+
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/granite-3.0-1b-a400m-instruct-Q8_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on \
+-ngl 99 --device GPUOpenCL -f ../models/fix-token.txt --no-display-prompt
 ```
