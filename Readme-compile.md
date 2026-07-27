@@ -57,9 +57,9 @@ server-http.h add header file.
 
 ```shell
 mkdir snapdragon
-cmake --install build-snapdragon --prefix snapdragon/ --config Release
+cmake --install build-snapdragon --prefix npu-profiling/ --config Release
 
-adb push snapdragon/ /data/local/tmp/
+adb push npu-profiling/ /data/local/tmp/
 ```
 
 # How to Run
@@ -106,4 +106,71 @@ LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models
 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/granite-3.0-1b-a400m-instruct-Q8_0.gguf \
 --ctx-size 8192 --batch-size 128 -fa on \
 -ngl 99 --device GPUOpenCL -f ../models/fix-token.txt --no-display-prompt
+```
+
+# NPU Profiling
+```shell
+cmake \
+-DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
+-DANDROID_ABI=arm64-v8a \
+-DANDROID_PLATFORM=android-31 \
+-DCMAKE_C_FLAGS="-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
+-DCMAKE_CXX_FLAGS="-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
+-DHEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT \
+-DHEXAGON_TOOLS_ROOT=$HEXAGON_TOOLS_ROOT \
+-DPREBUILT_LIB_DIR=android_aarch64 \
+-DGGML_OPENMP=OFF \
+-DGGML_LLAMAFILE=OFF \
+-DGGML_OPENCL=ON \
+-DGGML_HEXAGON=ON \
+-DGGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE=128 \
+-DGGML_HEXAGON_VERBOSE=1 \
+-DLLAMA_OPENSSL=OFF \
+-B build-snapdragon
+
+
+GGML_HEXAGON_VERBOSE=1 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on -v \
+-ngl 99 --device HTP0 -f ../models/fix-token.txt --no-display-prompt
+
+GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on -v \
+-ngl 99 --device HTP0 -f ../models/fix-token.txt --no-display-prompt
+
+--device GPUOpenCL
+--device HTP0,GPUOpenCL
+--device GPUOpenCL,HTP0
+
+GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 \
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on -v \
+-ngl 99 -n 128 --device GPUOpenCL,HTP0 -f ../models/fix-token.txt --no-display-prompt
+
+GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on -v \
+-ngl 99 --device GPUOpenCL -f ../models/fix-token.txt --no-display-prompt
+
+GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on -v \
+-ngl 99 --device HTP0,GPUOpenCL -f ../models/fix-token.txt --no-display-prompt
+
+GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on -v \
+-ngl 99 --device GPUOpenCL,HTP0 -f ../models/fix-token.txt --no-display-prompt
+
+LLAMA_LOG_VERBOSITY=4 \
+GGML_SCHED_DEBUG=2 \
+GGML_HEXAGON_VERBOSE=1 \
+GGML_HEXAGON_PROFILE=1 \
+LD_LIBRARY_PATH=lib \
+ADSP_LIBRARY_PATH=lib \
+./bin/llama-completion \
+    -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+    --device HTP0 \
+    -ngl 99 \
+    -c 1024 \
+    -b 128 \
+    -n 32 \
+    -p "Explain sparse matrix multiplication." \
+    2>&1 | tee hexagon-placement.log
 ```

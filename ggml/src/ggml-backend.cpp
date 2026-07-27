@@ -965,6 +965,19 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
         }
         if (sched->debug > 1) {
             ggml_backend_t tensor_backend = ggml_backend_sched_get_tensor_backend(sched, node);
+            const char * placement_backend = tensor_backend ? ggml_backend_name(tensor_backend) : "NULL";
+            GGML_LOG_DEBUG(
+                "GGML_PLACEMENT\t%d\t%s\t%s\t%s\t%s\t%lldx%lldx%lldx%lld\t%zu\n",
+                i,
+                ggml_op_desc(node),
+                node->name,
+                placement_backend,
+                ggml_type_name(node->type),
+                (long long) node->ne[0],
+                (long long) node->ne[1],
+                (long long) node->ne[2],
+                (long long) node->ne[3],
+                ggml_nbytes(node));
             GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
                 fmt_size(ggml_nbytes(node)), tensor_backend ? ggml_backend_name(tensor_backend) : "NULL", GET_CAUSE(node),
                 graph->use_counts[ggml_hash_find(&graph->visited_hash_set, node)], node->flags & GGML_TENSOR_FLAG_COMPUTE ? 1 : 0);
