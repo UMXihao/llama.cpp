@@ -66,6 +66,8 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
         }                                                           \
     } while (0)
 
+static constexpr int GGML_OPENCL_MOE_TILE_N = 32;
+
 //------------------------------------------------------------------------------
 // OpenCL
 //------------------------------------------------------------------------------
@@ -20339,7 +20341,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     const int ne21 = src->ne[1];
     const int nb21 = src->nb[1];
     const int ne02 = nb21 / src->nb[0];
-    const int n_tile_size = 32;
+    const int n_tile_size = GGML_OPENCL_MOE_TILE_N;
     const int max_post_router_tile = (ne20 * ne21 / n_tile_size) + ne02;
 
     cl_buffer_region region;
@@ -20429,6 +20431,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne21));
     CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne20));
     CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &ne02));
+    CL_CHECK(clSetKernelArg(kernel, 8, sizeof(int), &n_tile_size));
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, histogram_global_size, histogram_local_size, src);
 
@@ -20551,7 +20554,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
     int nrows = 1;  // number of row in src1
     int ndst  = 4;  // number of values produced by each subgroup
 
-    const int n_tile_size = 32;
+    const int n_tile_size = GGML_OPENCL_MOE_TILE_N;
     const int max_post_router_tile = (ne20 * ne21 / n_tile_size) + ne02;
 
     GGML_UNUSED(max_post_router_tile);
