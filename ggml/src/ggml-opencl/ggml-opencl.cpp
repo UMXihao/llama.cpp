@@ -47,6 +47,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <regex>
 #include <set>
 #include <unordered_set>
+#include <chrono>
 
 #undef MIN
 #undef MAX
@@ -350,6 +351,139 @@ struct ProfilingInfo {
     // Op output size.
     size_t output_size[4];
 };
+#ifdef GGML_OPENCL_PROFILING
+static inline uint64_t ggml_opencl_now_us() {
+    using namespace std::chrono;
+
+    return duration_cast<microseconds>(
+        steady_clock::now().time_since_epoch()
+    ).count();
+}
+
+static void ggml_opencl_profile_expert_write(
+        cl_command_queue queue,
+        cl_mem dst,
+        size_t dst_offset,
+        const void * src,
+        size_t bytes,
+        int layer_id,
+        int expert_id,
+        const char * weight_name) {
+
+    if (bytes == 0) {
+        return;
+    }
+
+    cl_event evt = nullptr;
+
+    // CPU 端开始时间：
+    // 表示 llama.cpp 请求加载 expert 的时刻
+    const uint64_t cpu_begin_us = ggml_opencl_now_us();
+
+    // 保持 CL_TRUE，
+    // 不改变原先 llama.cpp blocking write 的执行语义。
+    CL_CHECK(clEnqueueWriteBuffer(
+        queue,
+        dst,
+        CL_TRUE,
+        dst_offset,
+        bytes,
+        src,
+        0,
+        nullptr,
+        &evt
+    ));
+
+    const uint64_t cpu_end_us = ggml_opencl_now_us();
+
+    cl_ulong queued = 0;
+    cl_ulong submit = 0;
+    cl_ulong start  = 0;
+    cl_ulong end    = 0;
+
+    CL_CHECK(clGetEventProfilingInfo(
+        evt,
+        CL_PROFILING_COMMAND_QUEUED,
+        sizeof(queued),
+        &queued,
+        nullptr
+    ));
+
+    CL_CHECK(clGetEventProfilingInfo(
+        evt,
+        CL_PROFILING_COMMAND_SUBMIT,
+        sizeof(submit),
+        &submit,
+        nullptr
+    ));
+
+    CL_CHECK(clGetEventProfilingInfo(
+        evt,
+        CL_PROFILING_COMMAND_START,
+        sizeof(start),
+        &start,
+        nullptr
+    ));
+
+    CL_CHECK(clGetEventProfilingInfo(
+        evt,
+        CL_PROFILING_COMMAND_END,
+        sizeof(end),
+        &end,
+        nullptr
+    ));
+
+    const double queue_us =
+        (double) (submit - queued) / 1000.0;
+
+    const double submit_us =
+        (double) (start - submit) / 1000.0;
+
+    // 真正的数据传输/内存操作时间
+    const double transfer_us =
+        (double) (end - start) / 1000.0;
+
+    // OpenCL command 从 queued 到 end
+    const double total_us =
+        (double) (end - queued) / 1000.0;
+
+    // llama.cpp 调用层看到的 wall time
+    const double cpu_wall_us =
+        (double) (cpu_end_us - cpu_begin_us);
+
+    double bandwidth_GBs = 0.0;
+
+    if (transfer_us > 0.0) {
+        bandwidth_GBs =
+            ((double) bytes / 1e9) /
+            (transfer_us / 1e6);
+    }
+
+    GGML_LOG_INFO(
+        "[MOE-XFER] "
+        "L=%d E=%d W=%s "
+        "bytes=%zu "
+        "queue=%.3f us "
+        "submit=%.3f us "
+        "transfer=%.3f us "
+        "ocl_total=%.3f us "
+        "cpu_wall=%.3f us "
+        "BW=%.3f GB/s\n",
+        layer_id,
+        expert_id,
+        weight_name ? weight_name : "unknown",
+        bytes,
+        queue_us,
+        submit_us,
+        transfer_us,
+        total_us,
+        cpu_wall_us,
+        bandwidth_GBs
+    );
+
+    CL_CHECK(clReleaseEvent(evt));
+}
+#endif
 
 static void populateProfilingInfo(
         ProfilingInfo& info, cl_event evt, cl_kernel kernel, cl_uint work_dim,
@@ -936,10 +1070,12 @@ struct ggml_backend_opencl_context {
             return;
         }
 
-        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size\n");
+        fprintf(fperf, "op name, kernel name, queue duration (ms), submit duration (ms), exec duration (ms), global size, local size, output size\n");
         for (const ProfilingInfo & info : profiling_results) {
-            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
+            fprintf(fperf, "%s,%s,%f,%f,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
                 info.op_name.c_str(), info.kernel_name.c_str(),
+                info.cmd_queued_duration_ns/1.e6f,
+                info.cmd_submit_duration_ns/1.e6f,
                 info.cmd_duration_ns/1.e6f,
                 info.global_size[0], info.global_size[1], info.global_size[2],
                 info.local_size[0], info.local_size[1], info.local_size[2],
@@ -9367,9 +9503,23 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
     GGML_ASSERT(extra);
 
+#ifdef GGML_OPENCL_PROFILING
+    ggml_opencl_profile_expert_write(
+        queue,
+        extra->data_device,
+        extra->offset + offset,
+        data,
+        size,
+        0,
+        0,
+        tensor->name
+    );
+#else
+
     CL_CHECK(clEnqueueWriteBuffer(
         queue, extra->data_device, CL_TRUE, extra->offset + offset,
         size, data, 0, NULL, NULL));
+#endif
 
     GGML_UNUSED(buffer);
 }

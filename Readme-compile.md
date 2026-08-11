@@ -174,3 +174,84 @@ ADSP_LIBRARY_PATH=lib \
     -p "Explain sparse matrix multiplication." \
     2>&1 | tee hexagon-placement.log
 ```
+
+
+```shell
+
+nsys profile \
+    --trace=cuda,osrt,nvtx \
+    --sample=none \
+    -o moe_profile \
+    ./build/bin/llama-cli \
+    -m /data/deepseek-v2-lite-chat-q4_0.gguf \
+    --n-cpu-moe 30 \
+    -f ../SmartOrchV2/fix-token.txt \
+    -n 32
+```
+```shell    
+nsys stats \
+    --report cuda_gpu_mem_size_sum \
+    moe_profile.nsys-rep 
+    
+ ** CUDA GPU MemOps Summary (by Size) (cuda_gpu_mem_size_sum):
+
+ Total (MB)   Count  Avg (MB)   Med (MB)  Min (MB)   Max (MB)   StdDev (MB)            Operation           
+ -----------  -----  ---------  --------  --------  ----------  -----------  ------------------------------
+ 109,565.712     56  1,956.531     0.000     0.000  27,391.427    7,118.213  [CUDA memset]                 
+   8,030.877  1,703      4.716     0.049     0.000     172.032       13.588  [CUDA memcpy Host-to-Device]  
+      21.829  1,777      0.012     0.008     0.000       0.410        0.056  [CUDA memcpy Device-to-Host]  
+       0.442     54      0.008     0.008     0.008       0.008        0.000  [CUDA memcpy Device-to-Device]
+
+```
+
+```shell  
+nsys stats \
+    --report cuda_gpu_mem_time_sum \
+    --timeunit msec \
+    moe_profile.nsys-rep
+
+ ** CUDA GPU MemOps Summary (by Time) (cuda_gpu_mem_time_sum):
+
+ Time (%)  Total Time (ms)  Count  Avg (ms)  Med (ms)  Min (ms)  Max (ms)  StdDev (ms)            Operation           
+ --------  ---------------  -----  --------  --------  --------  --------  -----------  ------------------------------
+     89.6         572.8898  1,703    0.3364    0.0028    0.0003   14.4329       1.0181  [CUDA memcpy Host-to-Device]  
+     10.2          65.1686     56    1.1637    0.0003    0.0003   16.3312       4.2322  [CUDA memset]                 
+      0.2           1.1987  1,777    0.0007    0.0005    0.0003    0.0184       0.0017  [CUDA memcpy Device-to-Host]  
+      0.0           0.0442     54    0.0008    0.0008    0.0008    0.0009       0.0000  [CUDA memcpy Device-to-Device]
+
+```
+
+```shell 
+nsys stats \
+--report cuda_gpu_trace \
+--timeunit msec \
+moe_profile.nsys-rep
+```
+
+
+# GGML_OPENCL_PROFILING to profiling kernel launch
+```shell 
+cmake \
+-DCMAKE_TOOLCHAIN_FILE=$HOME/Sean/Hexagon_SDK/6.4.0.2/tools/android-ndk-r25c/build/cmake/android.toolchain.cmake \
+-DANDROID_ABI=arm64-v8a \
+-DANDROID_PLATFORM=android-28 \
+-DBUILD_SHARED_LIBS=OFF \
+-DLLAMA_CURL=OFF \
+-DCMAKE_CXX_FLAGS="-DGGML_OPENCL_PROFILING" \
+-DGGML_OPENCL=ON \
+-DGGML_OPENMP=OFF \
+-B build-android
+
+cmake --build build-android --config Release -j 22
+
+mkdir bandwidth
+
+cmake --install build-android --prefix bandwidth/ --config Release
+
+adb push bandwidth/ /data/local/tmp/
+
+LD_LIBRARY_PATH=lib ./bin/llama-completion -m ../models/deepseek-v2-lite-chat-q4_0.gguf -n 10 -no-cnv -f ../models/fix-token.txt -ngl 30 --n-cpu-moe 30 -v
+
+W=OpenCL#ffn_moe_down-9#0 bytes=6635520 queue=240.000 us submit=27.000 us transfer=10.000 us ocl_total=277.000 us cpu_wall=281.000 us BW=663.552 GB/s
+W=OpenCL#ffn_moe_down-9#0 bytes=49152 queue=5352.400 us submit=385.700 us transfer=8.400 us ocl_total=5746.500 us cpu_wall=5825.000 us BW=5.851 GB/s
+```
