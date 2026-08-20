@@ -245,7 +245,7 @@ cmake --build build-android --config Release -j 22
 
 mkdir bandwidth
 
-cmake --install build-android --prefix tile-size/ --config Release
+cmake --install build-android --prefix tile-64/ --config Release
 
 adb push bandwidth/ /data/local/tmp/
 
@@ -260,4 +260,15 @@ LD_LIBRARY_PATH=lib ./bin/llama-server -m ../models/deepseek-v2-lite-chat-q4_0.g
 adb forward tcp:8080 tcp:8080
 adb forward --remove tcp:8080
 
-GGML_OPENCL_MOE_PROFILE_DETAIL=1 LD_LIBRARY_PATH=lib ./bin/llama-completion -m ../models/deepseek-v2-lite-chat-q4_0.gguf -n 10 -no-cnv -f ../models/fix-token.txt -ngl 30 
+## Modify tile size
+GGML_OPENCL_MOE_TILE_N
+#define TILESIZE_N 32
+
+## tile compute time
+GGML_OPENCL_MOE_PROFILE_WARMUP=2 GGML_OPENCL_MOE_PROFILE_MAX_CALLS=120 GGML_OPENCL_MOE_PROFILE_DETAIL=1 LD_LIBRARY_PATH=lib ./bin/llama-completion -m ../models/deepseek-v2-lite-chat-q4_0.gguf -n 10 -no-cnv -f ../models/fix-token.txt -ngl 30 
+
+## tile load time
+export GGML_OPENCL_Q4_0_MOE_DP4A=0
+export GGML_OPENCL_MOE_WEIGHT_PROFILE_REPEAT=10
+
+GGML_OPENCL_MOE_WEIGHT_PROFILE_WARMUP=0 GGML_OPENCL_MOE_WEIGHT_PROFILE_MAX_CALLS=120 GGML_OPENCL_MOE_WEIGHT_PROFILE=1 LD_LIBRARY_PATH=lib ./bin/llama-completion -m ../models/deepseek-v2-lite-chat-q4_0.gguf -n 10 -no-cnv -f ../models/fix-token.txt -ngl 30

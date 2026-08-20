@@ -707,6 +707,7 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_moe_qa;   // int8 quants  [tok_slots * ne00]
     ggml_cl_buffer prealloc_moe_da;   // per-block d  [tok_slots * ne00/32] (half)
     ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
+    ggml_cl_buffer prealloc_moe_weight_probe_sink;
     // scratch copy of the router weights to avoid dst aliasing
     ggml_cl_buffer prealloc_moe_combine_w;
 
@@ -964,6 +965,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns_bin;
+    cl_kernel kernel_moe_q4_0_weight_load_probe = nullptr;
     cl_kernel kernel_gemm_moe_q8_0_f32_ns;
     cl_kernel kernel_gemv_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns_bin;
     cl_kernel kernel_gemv_moe_q5_0_f32_ns, kernel_gemm_moe_q5_0_f32_ns;
@@ -4354,6 +4356,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_moe_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q4_0_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q4_0_f32_ns", &err), err));
+        CL_CHECK((backend_ctx->kernel_moe_q4_0_weight_load_probe = clCreateKernel(prog, "kernel_moe_q4_0_weight_load_probe", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -6323,6 +6326,10 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 #ifdef GGML_OPENCL_PROFILING
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
+    const char * moe_weight_prof = getenv("GGML_OPENCL_MOE_WEIGHT_PROFILE");
+    if (moe_weight_prof && atoi(moe_weight_prof) != 0) {
+        command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
+    }
     // Fine-grained MoE profiling uses clGetEventProfilingInfo() even when the
     // generic GGML_OPENCL_PROFILING build option is disabled.
     const char * moe_profile_detail = getenv("GGML_OPENCL_MOE_PROFILE_DETAIL");
@@ -20903,6 +20910,166 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     CL_CHECK(clReleaseMemObject(emap_buf));
 }
 
+static int ggml_cl_moe_prof_env_int(const char * name, int default_value) {
+    const char * s = getenv(name);
+    return (s && s[0]) ? atoi(s) : default_value;
+}
+
+static double ggml_cl_moe_event_ms(cl_event evt) {
+    CL_CHECK(clWaitForEvents(1, &evt));
+
+    cl_ulong start_ns = 0;
+    cl_ulong end_ns   = 0;
+    CL_CHECK(clGetEventProfilingInfo(
+        evt, CL_PROFILING_COMMAND_START, sizeof(start_ns), &start_ns, nullptr));
+    CL_CHECK(clGetEventProfilingInfo(
+        evt, CL_PROFILING_COMMAND_END, sizeof(end_ns), &end_ns, nullptr));
+
+    return (double) (end_ns - start_ns) / 1.0e6;
+}
+
+static void ggml_cl_profile_q4_0_moe_weight_load(
+        ggml_backend_opencl_context * backend_ctx,
+        cl_mem q_img,
+        cl_mem d_buf,
+        cl_mem post_router,
+        cl_mem emap,
+        int ne00,
+        int ne01,
+        const ggml_tensor * dst) {
+    const char * enabled = getenv("GGML_OPENCL_MOE_WEIGHT_PROFILE");
+    if (!enabled || atoi(enabled) == 0) {
+        return;
+    }
+
+    static int profile_call = 0;
+    const int call_id = profile_call++;
+    const int max_calls =
+        ggml_cl_moe_prof_env_int("GGML_OPENCL_MOE_WEIGHT_PROFILE_MAX_CALLS", 1);
+    if (max_calls > 0 && call_id >= max_calls) {
+        return;
+    }
+
+    const int warmup =
+        MAX(0, ggml_cl_moe_prof_env_int("GGML_OPENCL_MOE_WEIGHT_PROFILE_WARMUP", 0));
+    const int repeat =
+        MAX(1, ggml_cl_moe_prof_env_int("GGML_OPENCL_MOE_WEIGHT_PROFILE_REPEAT", 5));
+    const int tile_size = 32;
+
+    // Drain the real MoE launch first. This probe is diagnostic only.
+    CL_CHECK(clFinish(backend_ctx->queue));
+
+    int total_tiles = 0;
+    CL_CHECK(clEnqueueReadBuffer(
+        backend_ctx->queue,
+        backend_ctx->prealloc_total_tiles.buffer,
+        CL_TRUE,
+        0,
+        sizeof(total_tiles),
+        &total_tiles,
+        0,
+        nullptr,
+        nullptr));
+
+    if (total_tiles <= 0) {
+        return;
+    }
+
+    std::vector<cl_ushort> h_emap((size_t) total_tiles);
+    std::vector<cl_uint> h_router((size_t) total_tiles * tile_size);
+
+    CL_CHECK(clEnqueueReadBuffer(
+        backend_ctx->queue, emap, CL_TRUE, 0,
+        h_emap.size() * sizeof(h_emap[0]), h_emap.data(),
+        0, nullptr, nullptr));
+
+    CL_CHECK(clEnqueueReadBuffer(
+        backend_ctx->queue, post_router, CL_TRUE, 0,
+        h_router.size() * sizeof(h_router[0]), h_router.data(),
+        0, nullptr, nullptr));
+
+    const size_t m_tiles = (size_t) ((ne01 + 63) / 64);
+    backend_ctx->prealloc_moe_weight_probe_sink.allocate(
+        backend_ctx->context, m_tiles * 64 * sizeof(cl_uint));
+
+    cl_kernel probe = backend_ctx->kernel_moe_q4_0_weight_load_probe;
+    cl_uint u_ne00 = (cl_uint) ne00;
+    cl_uint u_ne01 = (cl_uint) ne01;
+
+    int arg = 0;
+    CL_CHECK(clSetKernelArg(probe, arg++, sizeof(cl_mem), &q_img));
+    CL_CHECK(clSetKernelArg(probe, arg++, sizeof(cl_mem), &d_buf));
+    CL_CHECK(clSetKernelArg(probe, arg++, sizeof(cl_mem), &emap));
+    CL_CHECK(clSetKernelArg(
+        probe, arg++, sizeof(cl_mem), &backend_ctx->prealloc_total_tiles.buffer));
+    CL_CHECK(clSetKernelArg(
+        probe, arg++, sizeof(cl_mem), &backend_ctx->prealloc_moe_weight_probe_sink.buffer));
+    CL_CHECK(clSetKernelArg(probe, arg++, sizeof(cl_uint), &u_ne00));
+    CL_CHECK(clSetKernelArg(probe, arg++, sizeof(cl_uint), &u_ne01));
+
+    const size_t lws[3] = { 64, 1, 1 };
+    const size_t gws[3] = { 64, m_tiles, 1 };
+
+    static bool csv_has_header = false;
+    FILE * f = fopen("cl_moe_weight_load_profile.csv", csv_has_header ? "a" : "w");
+    if (f && !csv_has_header) {
+        fprintf(f, "call,tensor,tile,expert,valid,padding,load_avg_ms,load_min_ms\n");
+        csv_has_header = true;
+    }
+
+    for (int tile = 0; tile < total_tiles; ++tile) {
+        int valid = 0;
+        for (int lane = 0; lane < tile_size; ++lane) {
+            if (h_router[(size_t) tile * tile_size + lane] != 0xFFFFFFFFu) {
+                valid++;
+            }
+        }
+
+        const size_t gwo[3] = { 0, 0, (size_t) tile };
+
+        for (int r = 0; r < warmup; ++r) {
+            CL_CHECK(clEnqueueNDRangeKernel(
+                backend_ctx->queue, probe, 3, gwo, gws, lws,
+                0, nullptr, nullptr));
+            CL_CHECK(clFinish(backend_ctx->queue));
+        }
+
+        double sum_ms = 0.0;
+        double min_ms = 1.0e100;
+
+        for (int r = 0; r < repeat; ++r) {
+            cl_event evt = nullptr;
+            CL_CHECK(clEnqueueNDRangeKernel(
+                backend_ctx->queue, probe, 3, gwo, gws, lws,
+                0, nullptr, &evt));
+
+            const double ms = ggml_cl_moe_event_ms(evt);
+            CL_CHECK(clReleaseEvent(evt));
+
+            sum_ms += ms;
+            min_ms = MIN(min_ms, ms);
+        }
+
+        const double avg_ms = sum_ms / repeat;
+        const int expert = (int) h_emap[(size_t) tile];
+
+        fprintf(stderr,
+            "[MOE_WEIGHT_TILE] call=%d tile=%3d expert=%3d "
+            "valid=%2d padding=%2d load_avg_ms=%.6f load_min_ms=%.6f\n",
+            call_id, tile, expert, valid, tile_size - valid, avg_ms, min_ms);
+
+        if (f) {
+            fprintf(f, "%d,%s,%d,%d,%d,%d,%.9f,%.9f\n",
+                call_id, dst ? dst->name : "",
+                tile, expert, valid, tile_size - valid, avg_ms, min_ms);
+        }
+    }
+
+    if (f) {
+        fclose(f);
+    }
+}
+
 static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -21240,7 +21407,19 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Dispatch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
-
+                    // Probe matches the source FP16 kernel only.
+                    // DP4A has returned above; skip when the binary kernel is active.
+                    if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr) {
+                        ggml_cl_profile_q4_0_moe_weight_load(
+                            backend_ctx,
+                            extra0_q4_0->q_img,
+                            extra0_q4_0->d,
+                            buf_src2,
+                            buf_src2_emap,
+                            ne00,
+                            ne01,
+                            dst);
+                    }
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);
                     clReleaseMemObject(image_src1_reordered);

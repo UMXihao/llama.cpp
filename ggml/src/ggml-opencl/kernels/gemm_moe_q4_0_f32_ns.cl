@@ -322,3 +322,68 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
     barrier(CLK_GLOBAL_MEM_FENCE);
     write_imagef(dst, out_idx[0] + m_offset, (reg_c.s0));
 }
+
+// Diagnostic-only: replay one token tile and touch only the Q4_0 expert weights.
+// Host-side CL event timing of a z-size=1 launch is reported as that tile's
+// isolated expert-weight load wall time.
+kernel void kernel_moe_q4_0_weight_load_probe(
+        __read_only image1d_buffer_t src0_q,
+        __global half *              src0_d,
+        __global ushort *            src2_emap,
+        __global int *               total_tiles,
+        __global uint *              sink,
+        uint ne00,
+        uint ne01) {
+    const uint block_id_m = get_global_id(1);
+    const uint block_id_n = get_global_id(2);
+
+    if (block_id_n >= (uint) total_tiles[0]) {
+        return;
+    }
+
+    const ushort expert_id = src2_emap[block_id_n];
+    const uint row = block_id_m * TILESIZE_M;
+    const uint sub_block_id_m = get_local_id(0);
+
+    uint checksum = 0x9e3779b9u ^ (uint) expert_id;
+
+    // Match the source FP16 MoE kernel's expert-weight traversal.
+    for (uint step = 0; step < ne00; step += TILESIZE_K * 2) {
+        uint q_sub_offset =
+            row +
+            ((ne01 * step) >> 3) +
+            ((expert_id * ne00 * ne01) >> 3);
+
+        const uint s_sub_offset =
+            row +
+            ((ne01 * step) >> 5) +
+            ((expert_id * ne00 * ne01) >> 5);
+
+        // One Q4_0 scale for this 32-element K block.
+        const half s = src0_d[s_sub_offset + get_global_id(0)];
+
+        // First 16 q values.
+        uint q0 = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
+        uint q1 = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
+
+        checksum ^= q0;
+        checksum = rotate(checksum, 5u) ^ q1;
+        checksum ^= (uint) as_ushort(s);
+
+        // Second 16 q values.
+        const uint half_step = step + TILESIZE_K;
+        q_sub_offset =
+            row +
+            ((ne01 * half_step) >> 3) +
+            ((expert_id * ne00 * ne01) >> 3);
+
+        q0 = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
+        q1 = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
+
+        checksum = rotate(checksum, 7u) ^ q0;
+        checksum = rotate(checksum, 11u) ^ q1;
+    }
+
+    // Observable side effect: prevents dead-load elimination.
+    sink[block_id_m * TILESIZE_M + get_local_id(0)] = checksum;
+}
