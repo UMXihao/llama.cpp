@@ -255,3 +255,8 @@ LD_LIBRARY_PATH=lib ./bin/llama-completion -m ../models/deepseek-v2-lite-chat-q4
 W=OpenCL#ffn_moe_down-9#0 bytes=6635520 queue=240.000 us submit=27.000 us transfer=10.000 us ocl_total=277.000 us cpu_wall=281.000 us BW=663.552 GB/s
 W=OpenCL#ffn_moe_down-9#0 bytes=49152 queue=5352.400 us submit=385.700 us transfer=8.400 us ocl_total=5746.500 us cpu_wall=5825.000 us BW=5.851 GB/s
 ```
+
+LD_LIBRARY_PATH=lib ./bin/llama-server -m ../models/deepseek-v2-lite-chat-q4_0.gguf
+
+adb forward tcp:8080 tcp:8080
+adb forward --remove tcp:8080

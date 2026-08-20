@@ -1106,6 +1106,291 @@ struct ggml_backend_opencl_context {
         fclose(ftrace);
     }
 
+    struct MoeReplayTiming {
+        double avg_ms = 0.0;
+        double min_ms = 0.0;
+    };
+
+    static int moe_profile_env_int(const char * name, int default_value) {
+        const char * s = getenv(name);
+        if (!s || !s[0]) {
+            return default_value;
+        }
+        return atoi(s);
+    }
+
+    // Profile an isolated z-range of an already configured MoE GEMM kernel.
+    //
+    // Current Adreno MoE GEMMs use:
+    //   get_global_id(1) -> M tile
+    //   get_global_id(2) -> token tile
+    //
+    // Therefore a global_work_offset in dimension 2 can replay exactly one
+    // token tile, or a contiguous set of token tiles belonging to one expert,
+    // without changing kernel arguments.
+    MoeReplayTiming profile_moe_replay(
+            cl_kernel kernel,
+            const size_t base_gws[3],
+            const size_t base_lws[3],
+            size_t z_begin,
+            size_t z_count) {
+        MoeReplayTiming result;
+        if (z_count == 0) {
+            return result;
+        }
+
+        const int warmup = MAX(0, moe_profile_env_int("GGML_OPENCL_MOE_PROFILE_WARMUP", 1));
+        const int repeat = MAX(1, moe_profile_env_int("GGML_OPENCL_MOE_PROFILE_REPEAT", 3));
+
+        size_t gwo[3] = { 0, 0, z_begin };
+        size_t gws[3] = { base_gws[0], base_gws[1], z_count };
+        size_t lws[3] = { base_lws[0], base_lws[1], base_lws[2] };
+
+        // Make each isolated replay independent from previously queued work.
+        CL_CHECK(clFinish(queue));
+
+        for (int i = 0; i < warmup; ++i) {
+            cl_event evt = nullptr;
+            CL_CHECK(clEnqueueNDRangeKernel(
+                queue, kernel, 3, gwo, gws, lws, 0, nullptr, &evt));
+            CL_CHECK(clWaitForEvents(1, &evt));
+            CL_CHECK(clReleaseEvent(evt));
+        }
+
+        double sum_ms = 0.0;
+        double min_ms = 1.0e100;
+        for (int i = 0; i < repeat; ++i) {
+            cl_event evt = nullptr;
+            CL_CHECK(clEnqueueNDRangeKernel(
+                queue, kernel, 3, gwo, gws, lws, 0, nullptr, &evt));
+            CL_CHECK(clWaitForEvents(1, &evt));
+
+            cl_ulong start_ns = 0;
+            cl_ulong end_ns   = 0;
+            CL_CHECK(clGetEventProfilingInfo(
+                evt, CL_PROFILING_COMMAND_START, sizeof(start_ns), &start_ns, nullptr));
+            CL_CHECK(clGetEventProfilingInfo(
+                evt, CL_PROFILING_COMMAND_END, sizeof(end_ns), &end_ns, nullptr));
+            CL_CHECK(clReleaseEvent(evt));
+
+            const double ms = (double)(end_ns - start_ns) / 1.0e6;
+            sum_ms += ms;
+            min_ms = MIN(min_ms, ms);
+        }
+
+        result.avg_ms = sum_ms / repeat;
+        result.min_ms = min_ms;
+        return result;
+    }
+
+    // Diagnostic-only detailed MoE profiler.
+    //
+    // It is intentionally implemented as isolated kernel replay because an
+    // OpenCL event reports the timing of an entire NDRange, not individual
+    // work-groups. Dividing whole-kernel time by total_tiles is invalid when
+    // work-groups execute concurrently.
+    void maybe_profile_moe_detail(
+            cl_kernel kernel,
+            cl_uint work_dim,
+            const size_t global_work_size[3],
+            const size_t local_work_size[3],
+            const ggml_tensor * tensor) {
+        const char * enabled = getenv("GGML_OPENCL_MOE_PROFILE_DETAIL");
+        if (!enabled || atoi(enabled) == 0) {
+            return;
+        }
+        if (work_dim != 3 || !global_work_size || !local_work_size || !tensor) {
+            return;
+        }
+        if (!prealloc_total_tiles.buffer || !prealloc_emap.buffer || !prealloc_post_router.buffer) {
+            return;
+        }
+
+        char kernel_name[256] = {};
+        CL_CHECK(clGetKernelInfo(
+            kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, nullptr));
+
+        // Only sorted, tile-based MoE GEMMs. This excludes router/reorder/GEMV.
+        static const char * prefix = "kernel_gemm_moe_";
+        if (strncmp(kernel_name, prefix, strlen(prefix)) != 0) {
+            return;
+        }
+
+        const char * filter = getenv("GGML_OPENCL_MOE_PROFILE_FILTER");
+        if (filter && filter[0] &&
+            strstr(kernel_name, filter) == nullptr &&
+            strstr(tensor->name, filter) == nullptr) {
+            return;
+        }
+
+        static int matching_call_id = 0;
+        const int call_id = matching_call_id++;
+        const int max_calls = moe_profile_env_int("GGML_OPENCL_MOE_PROFILE_MAX_CALLS", 1);
+        if (max_calls > 0 && call_id >= max_calls) {
+            return;
+        }
+
+        const int tile_size = 32;
+        const ggml_tensor * weights = tensor->src[0];
+        if (!weights) {
+            return;
+        }
+        const int nexp = (int) weights->ne[2];
+        if (nexp <= 0) {
+            return;
+        }
+
+        // The regular GEMM has already been enqueued when this hook runs.
+        // Finish it before reading router metadata and replaying subranges.
+        CL_CHECK(clFinish(queue));
+
+        int total_tiles = 0;
+        CL_CHECK(clEnqueueReadBuffer(
+            queue, prealloc_total_tiles.buffer, CL_TRUE,
+            0, sizeof(total_tiles), &total_tiles, 0, nullptr, nullptr));
+        if (total_tiles <= 0) {
+            return;
+        }
+
+        std::vector<cl_ushort> emap((size_t) total_tiles);
+        std::vector<cl_uint> post_router((size_t) total_tiles * tile_size);
+        CL_CHECK(clEnqueueReadBuffer(
+            queue, prealloc_emap.buffer, CL_TRUE,
+            0, emap.size() * sizeof(emap[0]), emap.data(), 0, nullptr, nullptr));
+        CL_CHECK(clEnqueueReadBuffer(
+            queue, prealloc_post_router.buffer, CL_TRUE,
+            0, post_router.size() * sizeof(post_router[0]), post_router.data(), 0, nullptr, nullptr));
+
+        std::vector<int> tile_valid((size_t) total_tiles, 0);
+        std::vector<MoeReplayTiming> tile_time((size_t) total_tiles);
+
+        std::vector<int> expert_first((size_t) nexp, -1);
+        std::vector<int> expert_tiles((size_t) nexp, 0);
+        std::vector<int> expert_tokens((size_t) nexp, 0);
+        std::vector<double> expert_tile_sum((size_t) nexp, 0.0);
+        std::vector<double> expert_tile_max((size_t) nexp, 0.0);
+        std::vector<MoeReplayTiming> expert_iso((size_t) nexp);
+
+        // Replay the original full launch geometry as a baseline.  Its z size
+        // can be max_post_router_tile; inactive tiles exit via total_tiles[0].
+        const MoeReplayTiming full_time = profile_moe_replay(
+            kernel, global_work_size, local_work_size, 0, global_work_size[2]);
+
+        // Per-tile isolated latency.
+        for (int t = 0; t < total_tiles; ++t) {
+            int valid = 0;
+            for (int lane = 0; lane < tile_size; ++lane) {
+                if (post_router[(size_t)t * tile_size + lane] != 0xFFFFFFFFu) {
+                    ++valid;
+                }
+            }
+            tile_valid[(size_t)t] = valid;
+            tile_time[(size_t)t] = profile_moe_replay(
+                kernel, global_work_size, local_work_size, (size_t)t, 1);
+
+            const int e = (int) emap[(size_t)t];
+            if (e >= 0 && e < nexp) {
+                if (expert_first[(size_t)e] < 0) {
+                    expert_first[(size_t)e] = t;
+                }
+                ++expert_tiles[(size_t)e];
+                expert_tokens[(size_t)e] += valid;
+                expert_tile_sum[(size_t)e] += tile_time[(size_t)t].avg_ms;
+                expert_tile_max[(size_t)e] =
+                    MAX(expert_tile_max[(size_t)e], tile_time[(size_t)t].avg_ms);
+            }
+        }
+
+        // Per-expert isolated latency.  Router scan assigns each expert a
+        // contiguous tile interval, so one z-range preserves intra-expert
+        // tile parallelism.
+        for (int e = 0; e < nexp; ++e) {
+            if (expert_tiles[(size_t)e] == 0) {
+                continue;
+            }
+            expert_iso[(size_t)e] = profile_moe_replay(
+                kernel, global_work_size, local_work_size,
+                (size_t) expert_first[(size_t)e],
+                (size_t) expert_tiles[(size_t)e]);
+        }
+
+        fprintf(stderr,
+            "[MOE_PROFILE] call=%d tensor=%s kernel=%s total_tiles=%d "
+            "full_avg_ms=%.6f full_min_ms=%.6f repeat=%d warmup=%d\n",
+            call_id, tensor->name, kernel_name, total_tiles,
+            full_time.avg_ms, full_time.min_ms,
+            MAX(1, moe_profile_env_int("GGML_OPENCL_MOE_PROFILE_REPEAT", 3)),
+            MAX(0, moe_profile_env_int("GGML_OPENCL_MOE_PROFILE_WARMUP", 1)));
+
+        static bool tile_csv_initialized = false;
+        static bool expert_csv_initialized = false;
+        FILE * ftile = fopen("cl_moe_tile_profile.csv", tile_csv_initialized ? "a" : "w");
+        FILE * fexpert = fopen("cl_moe_expert_profile.csv", expert_csv_initialized ? "a" : "w");
+        if (ftile && !tile_csv_initialized) {
+            fprintf(ftile,
+                "call,tensor,kernel,tile,expert,valid,padding,avg_ms,min_ms\n");
+            tile_csv_initialized = true;
+        }
+        if (fexpert && !expert_csv_initialized) {
+            fprintf(fexpert,
+                "call,tensor,kernel,expert,tokens,tiles,tile_begin,tile_end,"
+                "isolated_avg_ms,isolated_min_ms,tile_sum_avg_ms,"
+                "tile_avg_ms,tile_max_ms\n");
+            expert_csv_initialized = true;
+        }
+
+        for (int t = 0; t < total_tiles; ++t) {
+            const int e = (int) emap[(size_t)t];
+            const int valid = tile_valid[(size_t)t];
+            fprintf(stderr,
+                "[MOE_PROFILE_TILE] call=%d tile=%3d expert=%3d "
+                "valid=%2d padding=%2d avg_ms=%.6f min_ms=%.6f\n",
+                call_id, t, e, valid, tile_size - valid,
+                tile_time[(size_t)t].avg_ms, tile_time[(size_t)t].min_ms);
+            if (ftile) {
+                fprintf(ftile, "%d,%s,%s,%d,%d,%d,%d,%.9f,%.9f\n",
+                    call_id, tensor->name, kernel_name, t, e,
+                    valid, tile_size - valid,
+                    tile_time[(size_t)t].avg_ms, tile_time[(size_t)t].min_ms);
+            }
+        }
+
+        for (int e = 0; e < nexp; ++e) {
+            const int nt = expert_tiles[(size_t)e];
+            if (nt == 0) {
+                continue;
+            }
+            const int begin = expert_first[(size_t)e];
+            const int end = begin + nt;
+            const double tile_avg = expert_tile_sum[(size_t)e] / nt;
+            fprintf(stderr,
+                "[MOE_PROFILE_EXPERT] call=%d expert=%3d tokens=%4d tiles=%2d "
+                "tile=[%3d,%3d) isolated_avg_ms=%.6f isolated_min_ms=%.6f "
+                "tile_sum_ms=%.6f tile_avg_ms=%.6f tile_max_ms=%.6f\n",
+                call_id, e, expert_tokens[(size_t)e], nt, begin, end,
+                expert_iso[(size_t)e].avg_ms, expert_iso[(size_t)e].min_ms,
+                expert_tile_sum[(size_t)e], tile_avg, expert_tile_max[(size_t)e]);
+            if (fexpert) {
+                fprintf(fexpert,
+                    "%d,%s,%s,%d,%d,%d,%d,%d,%.9f,%.9f,%.9f,%.9f,%.9f\n",
+                    call_id, tensor->name, kernel_name, e,
+                    expert_tokens[(size_t)e], nt, begin, end,
+                    expert_iso[(size_t)e].avg_ms,
+                    expert_iso[(size_t)e].min_ms,
+                    expert_tile_sum[(size_t)e],
+                    tile_avg,
+                    expert_tile_max[(size_t)e]);
+            }
+        }
+
+        if (ftile) {
+            fclose(ftile);
+        }
+        if (fexpert) {
+            fclose(fexpert);
+        }
+    }
+
     size_t get_kernel_workgroup_size(cl_kernel kernel) const {
         size_t workgroup_size = 0;
         size_t ret_size = 0;
@@ -6037,6 +6322,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 #ifdef GGML_OPENCL_PROFILING
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
+    // Fine-grained MoE profiling uses clGetEventProfilingInfo() even when the
+    // generic GGML_OPENCL_PROFILING build option is disabled.
+    const char * moe_profile_detail = getenv("GGML_OPENCL_MOE_PROFILE_DETAIL");
+    if (moe_profile_detail && atoi(moe_profile_detail) != 0) {
+        command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
+    }
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
 
     // delay kernel loading until the first buffer is created
