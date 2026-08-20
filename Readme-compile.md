@@ -232,12 +232,11 @@ moe_profile.nsys-rep
 # GGML_OPENCL_PROFILING to profiling kernel launch
 ```shell 
 cmake \
--DCMAKE_TOOLCHAIN_FILE=$HOME/Sean/Hexagon_SDK/6.4.0.2/tools/android-ndk-r25c/build/cmake/android.toolchain.cmake \
+-DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
 -DANDROID_ABI=arm64-v8a \
 -DANDROID_PLATFORM=android-28 \
 -DBUILD_SHARED_LIBS=OFF \
 -DLLAMA_CURL=OFF \
--DCMAKE_CXX_FLAGS="-DGGML_OPENCL_PROFILING" \
 -DGGML_OPENCL=ON \
 -DGGML_OPENMP=OFF \
 -B build-android
@@ -246,7 +245,7 @@ cmake --build build-android --config Release -j 22
 
 mkdir bandwidth
 
-cmake --install build-android --prefix bandwidth/ --config Release
+cmake --install build-android --prefix tile-size/ --config Release
 
 adb push bandwidth/ /data/local/tmp/
 
@@ -260,3 +259,5 @@ LD_LIBRARY_PATH=lib ./bin/llama-server -m ../models/deepseek-v2-lite-chat-q4_0.g
 
 adb forward tcp:8080 tcp:8080
 adb forward --remove tcp:8080
+
+GGML_OPENCL_MOE_PROFILE_DETAIL=1 LD_LIBRARY_PATH=lib ./bin/llama-completion -m ../models/deepseek-v2-lite-chat-q4_0.gguf -n 10 -no-cnv -f ../models/fix-token.txt -ngl 30 

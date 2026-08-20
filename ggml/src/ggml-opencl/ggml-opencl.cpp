@@ -1415,6 +1415,7 @@ struct ggml_backend_opencl_context {
         GGML_UNUSED(tensor);
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
 #endif
+        maybe_profile_moe_detail(kernel, work_dim, global_work_size, local_work_size, tensor);
     }
 
     const void * get_adreno_bin_kernel(const std::string &kernel_name, size_t *bin_size) const {

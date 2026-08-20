@@ -227,10 +227,10 @@ endif()
 # Apple XCFramework, or a WASM build). When the full tools build is enabled,
 # mtmd is already built by the tools/ subdirectory above; this hook only fires
 # when LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
-option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
-if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
-    add_subdirectory(tools/mtmd)
-endif()
+#option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
+#if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+#    add_subdirectory(tools/mtmd)
+#endif()
 
 #
 # install
