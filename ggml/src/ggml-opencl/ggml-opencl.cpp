@@ -1232,7 +1232,7 @@ struct ggml_backend_opencl_context {
             return;
         }
 
-        const int tile_size = 32;
+        const int tile_size = GGML_OPENCL_MOE_TILE_N;
         const ggml_tensor * weights = tensor->src[0];
         if (!weights) {
             return;
@@ -20954,7 +20954,7 @@ static void ggml_cl_profile_q4_0_moe_weight_load(
         MAX(0, ggml_cl_moe_prof_env_int("GGML_OPENCL_MOE_WEIGHT_PROFILE_WARMUP", 0));
     const int repeat =
         MAX(1, ggml_cl_moe_prof_env_int("GGML_OPENCL_MOE_WEIGHT_PROFILE_REPEAT", 5));
-    const int tile_size = 32;
+    const int tile_size = GGML_OPENCL_MOE_TILE_N;
 
     // Drain the real MoE launch first. This probe is diagnostic only.
     CL_CHECK(clFinish(backend_ctx->queue));

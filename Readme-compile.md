@@ -245,7 +245,7 @@ cmake --build build-android --config Release -j 22
 
 mkdir bandwidth
 
-cmake --install build-android --prefix tile-64/ --config Release
+cmake --install build-android --prefix tile/ --config Release
 
 adb push bandwidth/ /data/local/tmp/
 
