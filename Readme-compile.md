@@ -57,7 +57,7 @@ server-http.h add header file.
 
 ```shell
 mkdir snapdragon
-cmake --install build-snapdragon --prefix npu-profiling/ --config Release
+cmake --install build-snapdragon --prefix snapdragon/ --config Release
 
 adb push npu-profiling/ /data/local/tmp/
 ```
