@@ -59,7 +59,7 @@ server-http.h add header file.
 mkdir snapdragon
 cmake --install build-snapdragon --prefix snapdragon/ --config Release
 
-adb push npu-profiling/ /data/local/tmp/
+adb push snapdragon/ /data/local/tmp/
 ```
 
 # How to Run
@@ -272,3 +272,32 @@ export GGML_OPENCL_Q4_0_MOE_DP4A=0
 export GGML_OPENCL_MOE_WEIGHT_PROFILE_REPEAT=10
 
 GGML_OPENCL_MOE_WEIGHT_PROFILE_WARMUP=0 GGML_OPENCL_MOE_WEIGHT_PROFILE_MAX_CALLS=120 GGML_OPENCL_MOE_WEIGHT_PROFILE=1 LD_LIBRARY_PATH=lib ./bin/llama-completion -m ../models/deepseek-v2-lite-chat-q4_0.gguf -n 10 -no-cnv -f ../models/fix-token.txt -ngl 30
+
+# run SnapdragonProfiler
+./run_sdp.sh
+
+
+# GPU-NPU co-execution
+```c++
+if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+    moe_router_reoerder(backend, src2, ne20);
+    backend_ctx->toggle_reorder = false;
+}
+
+# Modify 
+moe_router_reoerder(backend, src2, ne20);
+backend_ctx->toggle_reorder = false;
+```
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib \
+./bin/llama-completion \
+-m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+--device HTP0,GPUOpenCL \
+--split-mode layer \
+--tensor-split 1,0 \
+-ngl 99 \
+-ot 'blk\.\d+\.ffn_(up|down|gate_up|gate)_(ch|)exps=OpenCL,blk\.\d+\.ffn_(up|down|gate)_shexp=OpenCL' \
+-c 4096 \
+-b 128 \
+-ub 128 -f ../models/fix-token.txt --no-display-prompt -v
+
+
