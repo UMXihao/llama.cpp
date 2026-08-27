@@ -104,6 +104,12 @@ struct htp_mm_context {
     const uint32_t * matrix_row_counts;
     const struct mmid_row_mapping * matrix_rows;
 
+    // MoE MUL_MAT_ID: per-expert HMX/HVX split.
+    // Zero-initialized for the normal pure-HVX/pure-HMX paths.
+    bool     mmid_hybrid;
+    uint32_t mmid_hmx_min_rows;
+    uint32_t mmid_hmx_min_util_pct;
+
     // Dynamic VTCM pointers allocated sequentially
     uint8_t * vtcm_src0;
     uint8_t * vtcm_src1;
@@ -1136,6 +1142,27 @@ static void hvx_mv_2d(unsigned int nth, unsigned int ith, void * data) {
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * ids->ne[0] * ids->ne[1] + (i1)]
 
+#define HTP_MM_MOE_HMX_MIN_ROWS       16u
+#define HTP_MM_MOE_HMX_MIN_UTIL_PCT   60u
+
+static inline bool mmid_is_hmx_worthy(
+    const struct htp_mm_context * mmctx,
+    uint32_t rows
+) {
+        if (rows == 0 || rows < mmctx->mmid_hmx_min_rows) {
+                return false;
+            }
+
+        // HMX M dimension is tiled in groups of 32 rows.  Penalize experts
+        // whose routed-token count leaves most of the last HMX tile empty.
+        const uint32_t padded_rows = hex_align_up(rows, HTP_MM_HMX_TILE_N_ROWS);
+        const uint64_t useful      = (uint64_t) rows * 100u;
+        const uint64_t threshold   =
+            (uint64_t) padded_rows * mmctx->mmid_hmx_min_util_pct;
+
+        return useful >= threshold;
+}
+
 static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
@@ -1179,6 +1206,11 @@ static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
     for (uint32_t cur_a = 0; cur_a < n_as; ++cur_a) {
         const int32_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) {
+            continue;
+        }
+
+        // The HMX pass already produced hot experts in hybrid mode.
+        if (mmctx->mmid_hybrid && mmid_is_hmx_worthy(mmctx, (uint32_t) cne1)) {
             continue;
         }
 
@@ -3073,6 +3105,10 @@ static int hmx_mm_op_matmul_id(
         const int32_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
 
+        if (mmctx->mmid_hybrid && !mmid_is_hmx_worthy(mmctx, (uint32_t) cne1)) {
+            continue;
+        }
+
         int ret = hmx_mm_id_2d_f32(octx->ctx, (float*) dst->data, (float*) src1->data,
                                    (const uint8_t *) src0->data + cur_a * nb02,
                                    cne1, ne00, ne01,
@@ -3182,6 +3218,160 @@ static int hvx_mm_matmul_id(
     return HTP_STATUS_OK;
 }
 
+static inline bool mmid_hybrid_hvx_supported(enum htp_data_type type) {
+    switch (type) {
+        case HTP_TYPE_Q4_0:
+        case HTP_TYPE_Q4_1:
+        case HTP_TYPE_Q8_0:
+        case HTP_TYPE_IQ4_NL:
+        case HTP_TYPE_MXFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Execute MUL_MAT_ID as two serial passes:
+//   1. HMX for experts with good 32-row tile utilization.
+//   2. HVX for the remaining experts.
+//
+// IMPORTANT:
+// hvx_mm_matmul_id() in this branch has the full 7-argument ABI:
+//
+//   hvx_mm_matmul_id(octx, mmctx,
+//                    src0_row_size_padded, src1_nrows,
+//                    matmul_id_job_func,
+//                    mapping_buf, must_free_mapping)
+//
+// We pass must_free_mapping=false because this helper owns mapping_buf until
+// BOTH HMX and HVX passes have completed.
+static int hmx_hvx_mm_op_matmul_id(
+    struct htp_ops_context * octx,
+    struct htp_mm_context * mmctx,
+    const uint32_t * matrix_row_counts,
+    const struct mmid_row_mapping * matrix_rows,
+    size_t src0_row_size_padded,
+    uint32_t src1_nrows,
+    void * mapping_buf,
+    bool must_free_mapping
+) {
+    htp_matmul_tensors_preamble;
+
+    const struct htp_mm_kernel_params * kparams =
+        (const struct htp_mm_kernel_params *) octx->kernel_params;
+
+    // Hybrid is only useful for multi-token MMID and weight formats already
+    // supported by the tiled HVX vec-dot kernels.
+    if (src1_nrows <= 1 || !mmid_hybrid_hvx_supported(src0->type)) {
+        mmctx->mmid_hybrid = false;
+        const int s = hmx_mm_op_matmul_id(
+                    octx, mmctx,
+                    matrix_row_counts, matrix_rows,
+                    mapping_buf, false);
+        if (must_free_mapping) {
+            free(mapping_buf);
+        }
+        return s;
+    }
+
+    mmctx->mmid_hybrid           = true;
+    mmctx->mmid_hmx_min_rows     = HTP_MM_MOE_HMX_MIN_ROWS;
+    mmctx->mmid_hmx_min_util_pct = HTP_MM_MOE_HMX_MIN_UTIL_PCT;
+
+    uint32_t n_hmx_experts = 0;
+    uint32_t n_hvx_experts = 0;
+    uint32_t hmx_rows = 0;
+    uint32_t hvx_rows = 0;
+    const uint32_t n_as = src0->ne[2];
+
+    for (uint32_t e = 0; e < n_as; ++e) {
+        const uint32_t rows = matrix_row_counts[e];
+        if (rows == 0) {
+            continue;
+        }
+
+        if (mmid_is_hmx_worthy(mmctx, rows)) {
+            ++n_hmx_experts;
+            hmx_rows += rows;
+        } else {
+            ++n_hvx_experts;
+            hvx_rows += rows;
+        }
+    }
+
+    FARF(HIGH,
+         "matmul-id hybrid: HMX experts=%u rows=%u, HVX experts=%u rows=%u\n",
+         n_hmx_experts, hmx_rows, n_hvx_experts, hvx_rows);
+
+    int s = HTP_STATUS_OK;
+
+    // Pass 1: HMX hot experts.
+    if (n_hmx_experts > 0) {
+       s = hmx_mm_op_matmul_id(
+           octx, mmctx,
+           matrix_row_counts, matrix_rows,
+           mapping_buf, false);
+        if (s != HTP_STATUS_OK) {
+            goto done;
+        }
+    }
+
+    if (n_hvx_experts > 0) {
+        if (hvx_mm_init_vec_dot(mmctx, src0->type) != 0) {
+            // Preserve correctness: recompute every expert with HMX.
+            mmctx->mmid_hybrid = false;
+            s = hmx_mm_op_matmul_id(
+                octx, mmctx,
+                matrix_row_counts, matrix_rows,
+                mapping_buf, false);
+            goto done;
+        }
+
+        // The host selected HMX for the whole op, therefore octx->kernel_params
+        // contains HMX settings.  hvx_mm_matmul_id() and hvx_mm_id() read the
+        // same blob, so temporarily replace it with a conservative HVX config.
+        //
+        // n_prefetch=2 minimizes VTCM pressure.  vtcm_size=0 tells the HVX
+        // setup code to use its computed layout size.
+        struct htp_mm_kernel_params saved_kparams = *kparams;
+        struct htp_mm_kernel_params hvx_kparams   = saved_kparams;
+        hvx_kparams.n_hmx       = 0;
+        hvx_kparams.kernel_type = src1_nrows < octx->n_threads
+            ? HTP_MM_KERNEL_HVX_QUANT_BLOCK
+            : HTP_MM_KERNEL_HVX_QUANT_ROW;
+        hvx_kparams.n_prefetch  = 2;
+        hvx_kparams.vtcm_size   = 0;
+
+        memcpy(octx->kernel_params, &hvx_kparams, sizeof(hvx_kparams));
+
+        s = hvx_mm_matmul_id(
+            octx,
+            mmctx,
+            src0_row_size_padded,
+            src1_nrows,
+            hvx_mm_id,
+            mapping_buf,
+            false);  // this helper frees mapping_buf after both passes
+
+        memcpy(octx->kernel_params, &saved_kparams, sizeof(saved_kparams));
+
+        if (s != HTP_STATUS_OK) {
+            // Safe fallback.  HMX overwrites any partial HVX/HMX outputs.
+            mmctx->mmid_hybrid = false;
+            s = hmx_mm_op_matmul_id(
+                octx, mmctx,
+               matrix_row_counts, matrix_rows,
+               mapping_buf, false);
+        }
+    }
+
+done:
+    if (must_free_mapping) {
+        free(mapping_buf);
+    }
+    return s;
+}
+
 int op_matmul_id(struct htp_ops_context * octx) {
     htp_matmul_tensors_preamble;
 
@@ -3268,7 +3458,15 @@ int op_matmul_id(struct htp_ops_context * octx) {
     }
 
     if (kparams->n_hmx) {
-        return hmx_mm_op_matmul_id(octx, mmctx, matrix_row_counts, matrix_rows, mapping_buf, must_free_mapping);
+        return hmx_hvx_mm_op_matmul_id(
+            octx,
+            mmctx,
+            matrix_row_counts,
+            matrix_rows,
+            src0_row_size_padded,
+            src1_nrows,
+            mapping_buf,
+            mapping_buf != octx->ctx->ddr_spad_base);
     }
 
     return hvx_mm_matmul_id(octx, mmctx, src0_row_size_padded, src1_nrows, matmul_id_job_func, mapping_buf, must_free_mapping);

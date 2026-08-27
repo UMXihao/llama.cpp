@@ -57,9 +57,9 @@ server-http.h add header file.
 
 ```shell
 mkdir snapdragon
-cmake --install build-snapdragon --prefix snapdragon/ --config Release
+cmake --install build-snapdragon --prefix hmx-hvx/ --config Release
 
-adb push snapdragon/ /data/local/tmp/
+adb push hmx-hvx/ /data/local/tmp/
 ```
 
 # How to Run
@@ -301,3 +301,8 @@ LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib \
 -ub 128 -f ../models/fix-token.txt --no-display-prompt -v
 
 
+
+
+GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-completion --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+--ctx-size 8192 --batch-size 128 -fa on -v \
+-ngl 99 --device HTP0 -f ../models/fix-token.txt --no-display-prompt -n 1 > llama.log 2>&1
