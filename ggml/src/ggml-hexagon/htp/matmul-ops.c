@@ -3293,15 +3293,17 @@ static int hmx_hvx_mm_op_matmul_id(
         if (mmid_is_hmx_worthy(mmctx, rows)) {
             ++n_hmx_experts;
             hmx_rows += rows;
+	    // FARF(ERROR, "matmul-id hybrid: HMX expert=%u rows=%u\n", e, rows);
         } else {
             ++n_hvx_experts;
             hvx_rows += rows;
+	    // FARF(ERROR, "matmul-id hybrid: HVX expert=%u rows=%u\n", e, rows);
         }
     }
 
-    FARF(HIGH,
-         "matmul-id hybrid: HMX experts=%u rows=%u, HVX experts=%u rows=%u\n",
-         n_hmx_experts, hmx_rows, n_hvx_experts, hvx_rows);
+    // FARF(ERROR,
+    //     "matmul-id hybrid: HMX experts=%u rows=%u, HVX experts=%u rows=%u\n",
+    //     n_hmx_experts, hmx_rows, n_hvx_experts, hvx_rows);
 
     int s = HTP_STATUS_OK;
 

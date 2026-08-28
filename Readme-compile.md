@@ -306,3 +306,97 @@ LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib \
 GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-completion --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
 --ctx-size 8192 --batch-size 128 -fa on -v \
 -ngl 99 --device HTP0 -f ../models/fix-token.txt --no-display-prompt -n 1 > llama.log 2>&1
+
+
+# FARF log output 
+adb logcat -c
+adb logcat -v time -s adsproc
+
+
+# Perfetto + FrameTimeline
+frame_test.pbtxt
+
+adb push frame_test.pbtxt /data/misc/perfetto-configs/
+
+adb shell pm list packages | grep example
+
+adb shell monkey -p com.example.game 1
+
+adb shell perfetto \
+--txt \
+-c /data/misc/perfetto-configs/frame_test.pbtxt \
+-o /data/misc/perfetto-traces/frame_test.perfetto-trace
+
+adb pull /data/misc/perfetto-traces/frame_test.perfetto-trace
+
+https://ui.perfetto.dev/
+
+## SQL
+```sql
+SELECT * FROM actual_frame_timeline_slice;
+
+######################### JANK RATE #########################
+SELECT
+COUNT(*) AS total_frames,
+
+    SUM(
+      CASE
+        WHEN jank_type != 'None'
+        THEN 1
+        ELSE 0
+      END
+    ) AS janky_frames,
+
+    100.0 *
+    SUM(
+      CASE
+        WHEN jank_type != 'None'
+        THEN 1
+        ELSE 0
+      END
+    ) / COUNT(*) AS jank_percent
+
+FROM actual_frame_timeline_slice;
+
+
+######################### AVG FPS #########################
+WITH frames AS (
+    SELECT ts
+    FROM actual_frame_timeline_slice
+),
+     range AS (
+         SELECT
+             MIN(ts) AS start_ts,
+             MAX(ts) AS end_ts,
+             COUNT(*) AS frame_count
+         FROM frames
+     )
+SELECT
+    frame_count,
+    (end_ts - start_ts) / 1e9 AS duration_sec,
+    frame_count / ((end_ts - start_ts) / 1e9) AS avg_fps
+FROM range;
+
+###################### ONE LOW FPS #########################
+WITH frames AS (
+    SELECT ts
+    FROM actual_frame_timeline_slice
+),
+     fps_per_second AS (
+         SELECT
+             CAST(ts / 1000000000 AS INT) AS second,
+    COUNT(*) AS fps
+FROM frames
+GROUP BY second
+    ),
+    ranked AS (
+SELECT
+    fps,
+    PERCENT_RANK() OVER (ORDER BY fps ASC) AS pct
+FROM fps_per_second
+    )
+SELECT
+    AVG(fps) AS one_percent_low_fps
+FROM ranked
+WHERE pct <= 0.01;
+```
