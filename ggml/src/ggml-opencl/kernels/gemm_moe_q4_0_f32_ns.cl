@@ -388,9 +388,10 @@ kernel void kernel_moe_q4_0_weight_load_probe(
     sink[block_id_m * TILESIZE_M + get_local_id(0)] = checksum;
 }
 
-// Experimental Q4_0 MoE GEMM for the 4 experts x 8 token packing layout.
-// The work-group geometry is unchanged (64 threads, TILESIZE_N=32). The B tile
-// is loaded once, while each 8-column quarter selects its own expert weights.
+// Experimental grouped Q4_0 MoE GEMM for 4x8 and 2x16 router layouts.
+// The work-group geometry remains 64 threads / TILESIZE_N=32. Computation still
+// uses four 8-column dotx8 microkernels; expert_slot_size only changes how those
+// four micro-groups map to emap entries.
 #define Q4_0_LOAD_EXPERT_4X8(EXPERT_ID, Q_STEP, SCALE) do { \
     const uint _q_sub_offset = row + ((ne01 * (Q_STEP)) >> 3) + (((uint)(EXPERT_ID) * ne00 * ne01) >> 3); \
     uint2 _q4x16; \
@@ -411,7 +412,8 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
         uint ne00,
         uint ne01,
         uint is_ragged,
-        uint skip_gran
+        uint skip_gran,
+        uint expert_slot_size
 ) {
     const uint block_id_m = get_global_id(1);
     const uint block_id_n = get_global_id(2);
@@ -419,10 +421,13 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
         return;
     }
 
-    // This kernel obtains sparsity directly from each 8-slot group. Keep the
-    // two legacy arguments so host-side argument numbering remains identical.
+    // expert_slot_size is 8 for 4x8 or 16 for 2x16. is_ragged/skip_gran are
+    // retained for argument compatibility with the legacy source kernel.
     (void)is_ragged;
     (void)skip_gran;
+    if (expert_slot_size != 8 && expert_slot_size != 16) {
+        return;
+    }
 
     const uint router_base = block_id_n * TILESIZE_N;
     const bool active_g0 = src2[router_base +  0] != 0xFFFFFFFFu;
@@ -430,11 +435,18 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
     const bool active_g2 = src2[router_base + 16] != 0xFFFFFFFFu;
     const bool active_g3 = src2[router_base + 24] != 0xFFFFFFFFu;
 
-    // Empty groups have no valid emap entry. Never dereference those entries.
-    const ushort expert0 = active_g0 ? src2_emap[block_id_n * 4 + 0] : (ushort)0;
-    const ushort expert1 = active_g1 ? src2_emap[block_id_n * 4 + 1] : (ushort)0;
-    const ushort expert2 = active_g2 ? src2_emap[block_id_n * 4 + 2] : (ushort)0;
-    const ushort expert3 = active_g3 ? src2_emap[block_id_n * 4 + 3] : (ushort)0;
+    // Empty micro-groups have no valid emap entry. For 2x16, micro-groups
+    // (0,1) share emap[0] and (2,3) share emap[1]. For 4x8 each has its own.
+    const uint emap_per_tile = expert_slot_size == 16 ? 2 : 4;
+    const uint emap_base = block_id_n * emap_per_tile;
+    const uint eidx0 = 0;
+    const uint eidx1 = expert_slot_size == 16 ? 0 : 1;
+    const uint eidx2 = expert_slot_size == 16 ? 1 : 2;
+    const uint eidx3 = expert_slot_size == 16 ? 1 : 3;
+    const ushort expert0 = active_g0 ? src2_emap[emap_base + eidx0] : (ushort)0;
+    const ushort expert1 = active_g1 ? src2_emap[emap_base + eidx1] : (ushort)0;
+    const ushort expert2 = active_g2 ? src2_emap[emap_base + eidx2] : (ushort)0;
+    const ushort expert3 = active_g3 ? src2_emap[emap_base + eidx3] : (ushort)0;
 
     __private half16 reg_a;
     __private float32 reg_c = (float32)(0);

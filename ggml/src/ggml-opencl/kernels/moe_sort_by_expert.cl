@@ -132,19 +132,22 @@ __kernel void kernel_moe_scan_4x8(
 ) {
     const int groups_per_tile = tile_size / expert_slot_size;
 
-    // This packing policy is intentionally specialized for 32 = 4 x 8.
-    if (groups_per_tile != 4) {
-        *total_tiles = 0;
+    // The grouped router supports 32 = 4 x 8 and 32 = 2 x 16.
+    if (groups_per_tile != 4 && groups_per_tile != 2) {
+        total_tiles[0] = 0;
         return;
     }
 
     int logical_groups = 0;
+    int dot8_groups = 0;
     for (int e = 0; e < (int)n_experts; ++e) {
         const int count = hist[e];
         const int groups = (count + expert_slot_size - 1) / expert_slot_size;
 
         group_offset[e] = logical_groups;
         logical_groups += groups;
+        // Q4_0 still executes 8-column microkernels even when the router slot is 16.
+        dot8_groups += (count + 7) / 8;
 
         // During scan hist[] is reused as the number of groups not yet packed,
         // and slot_counter[] as the number already mapped for this expert.
@@ -153,7 +156,59 @@ __kernel void kernel_moe_scan_4x8(
     }
 
     int physical_group = 0;
-    // 1) Four groups from one expert are ideal: no padding and one weight load.
+    // 2x16: consume two 16-token groups from the same expert whenever possible.
+    // This makes a full 32-token tile use one expert/weight run. Any odd remainders
+    // are then paired across experts; only the final odd remainder is padded.
+    if (groups_per_tile == 2) {
+        for (int e = 0; e < (int)n_experts; ++e) {
+            while (hist[e] >= 2) {
+                physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e, 2, physical_group);
+                hist[e] -= 2;
+            }
+        }
+
+        for (int e = 0; e < (int)n_experts; ++e) {
+            if (hist[e] == 1) {
+                physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e, 1, physical_group);
+                hist[e] = 0;
+            }
+        }
+        if ((physical_group & 1) != 0) {
+            ++physical_group;
+        }
+
+        int expert_runs_2x16 = 0;
+        for (int e = 0; e < (int)n_experts; ++e) {
+            const int mapped = slot_counter[e];
+            if (mapped <= 0) {
+                continue;
+            }
+            int prev = group_map[group_offset[e]];
+            ++expert_runs_2x16;
+            for (int i = 1; i < mapped; ++i) {
+                const int cur = group_map[group_offset[e] + i];
+                const bool contiguous = (cur == prev + 1) &&
+                                        ((cur / groups_per_tile) == (prev / groups_per_tile));
+                if (!contiguous) {
+                    ++expert_runs_2x16;
+                }
+                prev = cur;
+            }
+        }
+
+        total_tiles[0] = physical_group / groups_per_tile;
+        total_tiles[1] = logical_groups;
+        total_tiles[2] = expert_runs_2x16;
+        total_tiles[3] = dot8_groups;
+
+        for (int e = 0; e < (int)n_experts; ++e) {
+            hist[e] = 0;
+            slot_counter[e] = 0;
+        }
+        return;
+    }
+
+    // 4x8: four groups from one expert are ideal: no padding and one weight load.
     for (int e = 0; e < (int)n_experts; ++e) {
         while (hist[e] >= 4) {
             physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e, 4, physical_group);
@@ -297,10 +352,11 @@ __kernel void kernel_moe_scan_4x8(
     }
 
     // total_tiles[0] remains ABI-compatible with kernel_moe_fill and all GEMM
-    // kernels. The two extra words are diagnostic data for 4x8 only.
+    // kernels. Extra words are grouped-layout diagnostic data.
     total_tiles[0] = physical_group / groups_per_tile;
     total_tiles[1] = logical_groups;
     total_tiles[2] = expert_runs;
+    total_tiles[3] = dot8_groups;
 
     for (int e = 0; e < (int)n_experts; ++e) {
         hist[e] = 0;
@@ -342,7 +398,7 @@ __kernel void kernel_moe_scatter_4x8(
 
     post_router[tile_idx * tile_size + lane] = n * topK + k;
 
-    // emap is indexed by physical 8-token group, i.e. four entries per tile.
+    // emap is indexed by physical expert group: 4 entries/tile for 4x8, 2 for 2x16.
     // Multiple lanes of the same group store the same expert id, matching the
     // benign same-value race used by the legacy per-tile emap scatter.
     emap[physical_group] = (ushort)expert_id;
