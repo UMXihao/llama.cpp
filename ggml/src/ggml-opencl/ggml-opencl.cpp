@@ -746,7 +746,10 @@ struct ggml_backend_opencl_context {
 
     // prealloc buffers for MoE router table preprocess
     bool toggle_reorder = false;
+    // Kept for compatibility with the other quantized MoE paths: true means
+    // the cached router is using a grouped Q4_0 layout (4x8 or 2x16).
     bool moe_reorder_4x8 = false;
+    int moe_reorder_slot_size = 32;
     ggml_cl_buffer prealloc_post_router;
     ggml_cl_buffer prealloc_emap;
     ggml_cl_buffer prealloc_hist;
@@ -20785,8 +20788,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
 }
 
-static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src, int ne20, bool moe_4x8 = false) {
-    cl_int err;
+static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src, int ne20, int moe_expert_slot_size = 32) {    cl_int err;
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *)src->extra;
@@ -20796,12 +20798,14 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     const int nb21 = src->nb[1];
     const int ne02 = nb21 / src->nb[0];
     const int n_tile_size = GGML_OPENCL_MOE_TILE_N;
-    const int expert_slot_size = 8;
-    // In 4x8 mode a single hot expert can require ceil(M/8) physical tiles.
-    const int max_post_router_tile = moe_4x8
+    const bool moe_grouped = moe_expert_slot_size == 8 || moe_expert_slot_size == 16;
+    GGML_ASSERT(moe_expert_slot_size == 32 || moe_grouped);
+    const int expert_slot_size = moe_grouped ? moe_expert_slot_size : n_tile_size;
+    // Grouped layouts use a conservative capacity bound based on their slot size.
+    const int max_post_router_tile = moe_grouped
         ? ((ne20 * ne21 + expert_slot_size - 1) / expert_slot_size) + ne02
         : (ne20 * ne21 / n_tile_size) + ne02;
-    const int emap_per_tile = moe_4x8 ? (n_tile_size / expert_slot_size) : 1;
+    const int emap_per_tile = moe_grouped ? (n_tile_size / expert_slot_size) : 1;
 
     cl_buffer_region region;
     region.origin = offset;
@@ -20839,7 +20843,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     cl_mem slot_counter_buf = clCreateSubBuffer(backend_ctx->prealloc_slot_counter.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
     CL_CHECK(err);
 
-    const int total_tiles_words = moe_4x8 ? 3 : 1;
+    const int total_tiles_words = moe_grouped ? 4 : 1;
     backend_ctx->prealloc_total_tiles.allocate(backend_ctx->context, sizeof(int) * total_tiles_words);
     region.origin = 0;
     region.size = sizeof(int) * total_tiles_words;
@@ -20847,7 +20851,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     CL_CHECK(err);
     
     cl_mem group_map_buf = nullptr;
-    if (moe_4x8) {
+    if (moe_grouped) {
         backend_ctx->prealloc_group_map.allocate(backend_ctx->context, sizeof(int) * max_post_router_tile * emap_per_tile);
         region.origin = 0;
         region.size = sizeof(int) * max_post_router_tile * emap_per_tile;
@@ -20867,7 +20871,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, histogram_global_size, histogram_local_size, src);
 
     // Scan / physical-group mapping
-    if (moe_4x8) {
+    if (moe_grouped) {
         kernel = backend_ctx->kernel_moe_scan_4x8;
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &hist_buf));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &tile_offset_buf));
@@ -20902,7 +20906,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, fill_global_size, fill_local_size, src);
 
     // Scatter
-    if (moe_4x8) {
+    if (moe_grouped) {
         kernel = backend_ctx->kernel_moe_scatter_4x8;
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &original_router_buf));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &post_router_buf));
@@ -20935,21 +20939,23 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     // routing count. Quantifies the per-expert tile-padding waste. Blocking
     // readback perturbs timing -> diagnostic only.
     if (getenv("GGML_OPENCL_MOE_TILES_DEBUG")) {
-        int h_stats[3] = {0, 0, 0};
+        int h_stats[4] = {0, 0, 0, 0};
         clFinish(backend_ctx->queue);
         CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, total_tiles_buf, CL_TRUE, 0,
             sizeof(int) * total_tiles_words, h_stats, 0, NULL, NULL));        const int routings = ne20 * ne21;
         const int h_total  = h_stats[0];
         const int ideal    = (routings + n_tile_size - 1) / n_tile_size;
         const int slots     = h_total * n_tile_size;
+        const char * layout = expert_slot_size == 8 ? "4x8" : (expert_slot_size == 16 ? "2x16" : "1x32");
         fprintf(stderr, "[MOE_TILES] layout=%s routings=%d (ne20=%d ne21=%d nexp=%d) total_tiles=%d ideal=%d slots=%d pad=%.1f%%\n",
-                moe_4x8 ? "4x8" : "1x32", routings, ne20, ne21, ne02, h_total, ideal, slots,
+        layout, routings, ne20, ne21, ne02, h_total, ideal, slots,
                  routings > 0 ? 100.0 * (slots - routings) / routings : 0.0);
         fflush(stderr);
     }
 
-    backend_ctx->moe_reorder_4x8 = moe_4x8;
-    
+    backend_ctx->moe_reorder_4x8 = moe_grouped;
+    backend_ctx->moe_reorder_slot_size = expert_slot_size;
+
     CL_CHECK(clReleaseMemObject(original_router_buf));
     CL_CHECK(clReleaseMemObject(hist_buf));
     CL_CHECK(clReleaseMemObject(tile_offset_buf));
@@ -21288,52 +21294,61 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         const char * e = getenv("GGML_OPENCL_Q4_0_MOE_4X8");
                         return e && e[0] != '\0' && atoi(e) != 0;
                     }();
-                    kernel = q4_0_moe_4x8
+                    static const bool q4_0_moe_2x16 = []{
+                        const char * e = getenv("GGML_OPENCL_Q4_0_MOE_2X16");
+                        return e && e[0] != '\0' && atoi(e) != 0;
+                    }();
+                    GGML_ASSERT(!(q4_0_moe_4x8 && q4_0_moe_2x16));
+
+                    const bool q4_0_moe_grouped = q4_0_moe_4x8 || q4_0_moe_2x16;
+                    const int q4_0_expert_slot_size = q4_0_moe_2x16 ? 16 : (q4_0_moe_4x8 ? 8 : 32);
+                    const int q4_0_emap_per_tile = q4_0_moe_grouped ? (n_tile_size / q4_0_expert_slot_size) : 1;
+
+                    kernel = q4_0_moe_grouped
                         ? backend_ctx->kernel_gemm_moe_q4_0_f32_ns_4x8
                         : backend_ctx->kernel_gemm_moe_q4_0_f32_ns;
-                    if (!q4_0_moe_4x8 && backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
+                    if (!q4_0_moe_grouped && backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
                         kernel = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin;
                     }
 
-                    const int q4_0_max_post_router_tile = q4_0_moe_4x8
-                        ? ((ne20 * ne21 + 7) / 8) + ne02
+                    const int q4_0_max_post_router_tile = q4_0_moe_grouped
+                        ? ((ne20 * ne21 + q4_0_expert_slot_size - 1) / q4_0_expert_slot_size) + ne02
                         : (ne20 * ne21 / n_tile_size) + ne02;
 
-                    // Reorder router if called from test-backend-ops, when a new router is generated,
-                    // or when switching between the legacy 1x32 and Q4_0 4x8 layouts.
+                    // Reorder when the router changes or when switching 1x32 / 4x8 / 2x16.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder ||
-                        backend_ctx->moe_reorder_4x8 != q4_0_moe_4x8) {
-                        moe_router_reoerder(backend, src2, ne20, q4_0_moe_4x8);
+                        backend_ctx->moe_reorder_slot_size != q4_0_expert_slot_size) {
+                        moe_router_reoerder(backend, src2, ne20, q4_0_expert_slot_size);
                         backend_ctx->toggle_reorder = false;
                     }
-                    // Diagnostic only: count the logical dotx8_reduce4 invocations
-                    // for this specific Q4_0 matrix. Router stats are stable while
-                    // the reordered router is reused, but ne00/ne01 can differ
-                    // between gate/up/down expert matrices.
-                    if (q4_0_moe_4x8 && getenv("GGML_OPENCL_MOE_TILES_DEBUG")) {
-                        int h_stats[3] = {0, 0, 0};
+                    // Diagnostic only: router stats plus the actual 8-column microkernel
+                    // count for this specific Q4_0 matrix. In 2x16, logical_groups
+                    // counts 16-token groups while dot8_groups counts active 8-token halves.
+                    if (q4_0_moe_grouped && getenv("GGML_OPENCL_MOE_TILES_DEBUG")) {
+                        int h_stats[4] = {0, 0, 0, 0};
                         clFinish(backend_ctx->queue);
                         CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, backend_ctx->prealloc_total_tiles.buffer,
                                                      CL_TRUE, 0, sizeof(h_stats), h_stats, 0, NULL, NULL));
 
                         const int logical_groups = h_stats[1];
                         const int expert_runs    = h_stats[2];
-                        // gemm_moe_q4_0_f32_ns.cl: TILESIZE_K=16, TILESIZE_M=64.
+                        const int dot8_groups    = h_stats[3];
                         const int k_halves = ne00 / 16;
                         const int m_wgs    = (ne01 + 63) / 64;
 
-                        const long long dotx8_per_mwg = (long long)logical_groups * k_halves;
+                        const long long dotx8_per_mwg = (long long)dot8_groups * k_halves;
                         const long long dotx8_wg_calls = dotx8_per_mwg * m_wgs;
                         const long long dotx8_workitem_calls = dotx8_wg_calls * 64;
                         const long long weight_load_per_mwg = (long long)expert_runs * k_halves;
                         const long long weight_load_wg_calls = weight_load_per_mwg * m_wgs;
+                        const char * layout = q4_0_moe_2x16 ? "2x16" : "4x8";
 
                         fprintf(stderr,
-                                "[MOE_4X8_STATS] weight=%s groups=%d expert_runs=%d groups_per_run=%.3f "
-                                "ne00=%d ne01=%d k_halves=%d m_wgs=%d dotx8_per_mwg=%lld "
-                                "dotx8_wg_calls=%lld dotx8_workitem_calls=%lld "
+                        "[MOE_GROUPED_STATS] layout=%s weight=%s groups=%d dot8_groups=%d "
+                        "expert_runs=%d groups_per_run=%.3f ne00=%d ne01=%d k_halves=%d m_wgs=%d "
+                        "dotx8_per_mwg=%lld dotx8_wg_calls=%lld dotx8_workitem_calls=%lld "
                                 "weight_load_per_mwg=%lld weight_load_wg_calls=%lld\n",
-                                src0->name, logical_groups, expert_runs,
+                                layout, src0->name, logical_groups, dot8_groups, expert_runs,
                                 expert_runs > 0 ? (double)logical_groups / expert_runs : 0.0,
                                 ne00, ne01, k_halves, m_wgs,
                                 dotx8_per_mwg, dotx8_wg_calls, dotx8_workitem_calls,
@@ -21351,7 +21366,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         ? (atoi(q4_0_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
                     // bin kernel takes precedence
-                    use_moe_dp4a = use_moe_dp4a && !q4_0_moe_4x8 && backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr;
+                    use_moe_dp4a = use_moe_dp4a && !q4_0_moe_grouped && backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr;
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -21360,7 +21375,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     region.origin = 0;
-                    region.size = sizeof(short) * q4_0_max_post_router_tile * (q4_0_moe_4x8 ? 4 : 1);
+                    region.size = sizeof(short) * q4_0_max_post_router_tile * q4_0_emap_per_tile;
                     buf_src2_emap = clCreateSubBuffer(backend_ctx->prealloc_emap.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
@@ -21496,6 +21511,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_use_moe_ragged));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_uint),   &backend_ctx->adreno_moe_ragged_skip_gran));
+                    if (q4_0_moe_grouped) {
+                        CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int), &q4_0_expert_slot_size));
+                    }
 
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
