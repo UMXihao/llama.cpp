@@ -400,3 +400,7 @@ SELECT
 FROM ranked
 WHERE pct <= 0.01;
 ```
+
+# 4x8 Multi expert on one Tile 
+GGML_OPENCL_Q4_0_MOE_4X8=1
+

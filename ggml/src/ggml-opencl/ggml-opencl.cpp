@@ -20839,9 +20839,10 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     cl_mem slot_counter_buf = clCreateSubBuffer(backend_ctx->prealloc_slot_counter.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
     CL_CHECK(err);
 
-    backend_ctx->prealloc_total_tiles.allocate(backend_ctx->context, sizeof(int));
+    const int total_tiles_words = moe_4x8 ? 3 : 1;
+    backend_ctx->prealloc_total_tiles.allocate(backend_ctx->context, sizeof(int) * total_tiles_words);
     region.origin = 0;
-    region.size = sizeof(int);
+    region.size = sizeof(int) * total_tiles_words;
     cl_mem total_tiles_buf = clCreateSubBuffer(backend_ctx->prealloc_total_tiles.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
     CL_CHECK(err);
     
@@ -20934,10 +20935,11 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     // routing count. Quantifies the per-expert tile-padding waste. Blocking
     // readback perturbs timing -> diagnostic only.
     if (getenv("GGML_OPENCL_MOE_TILES_DEBUG")) {
-        int h_total = 0;
+        int h_stats[3] = {0, 0, 0};
         clFinish(backend_ctx->queue);
-        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, total_tiles_buf, CL_TRUE, 0, sizeof(int), &h_total, 0, NULL, NULL));
-        const int routings = ne20 * ne21;
+        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, total_tiles_buf, CL_TRUE, 0,
+            sizeof(int) * total_tiles_words, h_stats, 0, NULL, NULL));        const int routings = ne20 * ne21;
+        const int h_total  = h_stats[0];
         const int ideal    = (routings + n_tile_size - 1) / n_tile_size;
         const int slots     = h_total * n_tile_size;
         fprintf(stderr, "[MOE_TILES] layout=%s routings=%d (ne20=%d ne21=%d nexp=%d) total_tiles=%d ideal=%d slots=%d pad=%.1f%%\n",
@@ -21303,6 +21305,40 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         backend_ctx->moe_reorder_4x8 != q4_0_moe_4x8) {
                         moe_router_reoerder(backend, src2, ne20, q4_0_moe_4x8);
                         backend_ctx->toggle_reorder = false;
+                    }
+                    // Diagnostic only: count the logical dotx8_reduce4 invocations
+                    // for this specific Q4_0 matrix. Router stats are stable while
+                    // the reordered router is reused, but ne00/ne01 can differ
+                    // between gate/up/down expert matrices.
+                    if (q4_0_moe_4x8 && getenv("GGML_OPENCL_MOE_TILES_DEBUG")) {
+                        int h_stats[3] = {0, 0, 0};
+                        clFinish(backend_ctx->queue);
+                        CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, backend_ctx->prealloc_total_tiles.buffer,
+                                                     CL_TRUE, 0, sizeof(h_stats), h_stats, 0, NULL, NULL));
+
+                        const int logical_groups = h_stats[1];
+                        const int expert_runs    = h_stats[2];
+                        // gemm_moe_q4_0_f32_ns.cl: TILESIZE_K=16, TILESIZE_M=64.
+                        const int k_halves = ne00 / 16;
+                        const int m_wgs    = (ne01 + 63) / 64;
+
+                        const long long dotx8_per_mwg = (long long)logical_groups * k_halves;
+                        const long long dotx8_wg_calls = dotx8_per_mwg * m_wgs;
+                        const long long dotx8_workitem_calls = dotx8_wg_calls * 64;
+                        const long long weight_load_per_mwg = (long long)expert_runs * k_halves;
+                        const long long weight_load_wg_calls = weight_load_per_mwg * m_wgs;
+
+                        fprintf(stderr,
+                                "[MOE_4X8_STATS] weight=%s groups=%d expert_runs=%d groups_per_run=%.3f "
+                                "ne00=%d ne01=%d k_halves=%d m_wgs=%d dotx8_per_mwg=%lld "
+                                "dotx8_wg_calls=%lld dotx8_workitem_calls=%lld "
+                                "weight_load_per_mwg=%lld weight_load_wg_calls=%lld\n",
+                                src0->name, logical_groups, expert_runs,
+                                expert_runs > 0 ? (double)logical_groups / expert_runs : 0.0,
+                                ne00, ne01, k_halves, m_wgs,
+                                dotx8_per_mwg, dotx8_wg_calls, dotx8_workitem_calls,
+                                weight_load_per_mwg, weight_load_wg_calls);
+                        fflush(stderr);
                     }
 
                     cl_mem sub_buf_src1_pre, sub_buf_dst, buf_dst_image;

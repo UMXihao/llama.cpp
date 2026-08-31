@@ -272,6 +272,35 @@ __kernel void kernel_moe_scan_4x8(
     }
 
     *total_tiles = physical_group / groups_per_tile;
+    // Derive statistics from the final mapping. A run is a maximal sequence of
+    // groups belonging to the same expert that is contiguous inside one
+    // physical tile. This is exactly the unit for which the Q4_0 4x8 GEMM can
+    // reuse one weight load/dequantization.
+    int expert_runs = 0;
+    for (int e = 0; e < (int)n_experts; ++e) {
+        const int mapped = slot_counter[e];
+        if (mapped <= 0) {
+            continue;
+        }
+
+        int prev = group_map[group_offset[e]];
+        ++expert_runs;
+        for (int i = 1; i < mapped; ++i) {
+            const int cur = group_map[group_offset[e] + i];
+            const bool contiguous = (cur == prev + 1) &&
+                                    ((cur / groups_per_tile) == (prev / groups_per_tile));
+            if (!contiguous) {
+                ++expert_runs;
+            }
+            prev = cur;
+        }
+    }
+
+    // total_tiles[0] remains ABI-compatible with kernel_moe_fill and all GEMM
+    // kernels. The two extra words are diagnostic data for 4x8 only.
+    total_tiles[0] = physical_group / groups_per_tile;
+    total_tiles[1] = logical_groups;
+    total_tiles[2] = expert_runs;
 
     for (int e = 0; e < (int)n_experts; ++e) {
         hist[e] = 0;
