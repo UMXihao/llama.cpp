@@ -746,12 +746,14 @@ struct ggml_backend_opencl_context {
 
     // prealloc buffers for MoE router table preprocess
     bool toggle_reorder = false;
+    bool moe_reorder_4x8 = false;
     ggml_cl_buffer prealloc_post_router;
     ggml_cl_buffer prealloc_emap;
     ggml_cl_buffer prealloc_hist;
     ggml_cl_buffer prealloc_tile_offset;
     ggml_cl_buffer prealloc_total_tiles;
     ggml_cl_buffer prealloc_slot_counter;
+    ggml_cl_buffer prealloc_group_map;
 
     cl_program program_add;
     cl_program program_add_id;
@@ -964,8 +966,7 @@ struct ggml_backend_opencl_context {
     // tgpp 0 = TG variant (COLS_PER_LANE_GROUP=1), tgpp 1 = prefill variant (COLS_PER_LANE_GROUP=4).
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
     cl_kernel kernel_timestep_embedding;
-    cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns_bin;
-    cl_kernel kernel_moe_q4_0_weight_load_probe = nullptr;
+    cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns_4x8, kernel_gemm_moe_q4_0_f32_ns_bin;    cl_kernel kernel_moe_q4_0_weight_load_probe = nullptr;
     cl_kernel kernel_gemm_moe_q8_0_f32_ns;
     cl_kernel kernel_gemv_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns_bin;
     cl_kernel kernel_gemv_moe_q5_0_f32_ns, kernel_gemm_moe_q5_0_f32_ns;
@@ -990,6 +991,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_moe_q4_0_q8_1_dp4a;    // dp4a (int8) q4_0 MoE prefill GEMM
     cl_kernel kernel_moe_reorder_b;
     cl_kernel kernel_moe_histogram, kernel_moe_scan, kernel_moe_fill, kernel_moe_scatter;
+    cl_kernel kernel_moe_scan_4x8, kernel_moe_scatter_4x8;
     cl_kernel kernel_moe_combine_f32 = nullptr;   // fused router-weight mul + cross-expert sum
     cl_kernel kernel_mul_mv_id_q4_0_f32_8x_flat;
     cl_kernel kernel_mul_mv_id_q8_0_f32, kernel_mul_mv_id_q8_0_f32_flat;
@@ -4356,6 +4358,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), CL_moe_compile_opts);
 
         CL_CHECK((backend_ctx->kernel_gemm_moe_q4_0_f32_ns = clCreateKernel(prog, "kernel_gemm_moe_q4_0_f32_ns", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_moe_q4_0_f32_ns_4x8 = clCreateKernel(prog, "kernel_gemm_moe_q4_0_f32_ns_4x8", &err), err));
         CL_CHECK((backend_ctx->kernel_moe_q4_0_weight_load_probe = clCreateKernel(prog, "kernel_moe_q4_0_weight_load_probe", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
@@ -4783,8 +4786,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_moe_histogram = clCreateKernel(prog, "kernel_moe_histogram", &err), err));
         CL_CHECK((backend_ctx->kernel_moe_scan = clCreateKernel(prog, "kernel_moe_scan", &err), err));
+        CL_CHECK((backend_ctx->kernel_moe_scan_4x8 = clCreateKernel(prog, "kernel_moe_scan_4x8", &err), err));
         CL_CHECK((backend_ctx->kernel_moe_fill = clCreateKernel(prog, "kernel_moe_fill", &err), err));
         CL_CHECK((backend_ctx->kernel_moe_scatter = clCreateKernel(prog, "kernel_moe_scatter", &err), err));
+        CL_CHECK((backend_ctx->kernel_moe_scatter_4x8 = clCreateKernel(prog, "kernel_moe_scatter_4x8", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -20780,7 +20785,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
 }
 
-static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src, int ne20) {
+static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src, int ne20, bool moe_4x8 = false) {
     cl_int err;
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -20791,7 +20796,12 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     const int nb21 = src->nb[1];
     const int ne02 = nb21 / src->nb[0];
     const int n_tile_size = GGML_OPENCL_MOE_TILE_N;
-    const int max_post_router_tile = (ne20 * ne21 / n_tile_size) + ne02;
+    const int expert_slot_size = 8;
+    // In 4x8 mode a single hot expert can require ceil(M/8) physical tiles.
+    const int max_post_router_tile = moe_4x8
+        ? ((ne20 * ne21 + expert_slot_size - 1) / expert_slot_size) + ne02
+        : (ne20 * ne21 / n_tile_size) + ne02;
+    const int emap_per_tile = moe_4x8 ? (n_tile_size / expert_slot_size) : 1;
 
     cl_buffer_region region;
     region.origin = offset;
@@ -20805,9 +20815,9 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     cl_mem post_router_buf = clCreateSubBuffer(backend_ctx->prealloc_post_router.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
     CL_CHECK(err);
 
-    backend_ctx->prealloc_emap.allocate(backend_ctx->context, sizeof(short) * max_post_router_tile);
+    backend_ctx->prealloc_emap.allocate(backend_ctx->context, sizeof(short) * max_post_router_tile * emap_per_tile);
     region.origin = 0;
-    region.size = sizeof(short) * max_post_router_tile;
+    region.size = sizeof(short) * max_post_router_tile * emap_per_tile;
     cl_mem emap_buf = clCreateSubBuffer(backend_ctx->prealloc_emap.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
     CL_CHECK(err);
 
@@ -20834,7 +20844,15 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     region.size = sizeof(int);
     cl_mem total_tiles_buf = clCreateSubBuffer(backend_ctx->prealloc_total_tiles.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
     CL_CHECK(err);
-
+    
+    cl_mem group_map_buf = nullptr;
+    if (moe_4x8) {
+        backend_ctx->prealloc_group_map.allocate(backend_ctx->context, sizeof(int) * max_post_router_tile * emap_per_tile);
+        region.origin = 0;
+        region.size = sizeof(int) * max_post_router_tile * emap_per_tile;
+        group_map_buf = clCreateSubBuffer(backend_ctx->prealloc_group_map.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+        CL_CHECK(err);
+    }
     // Histogram
     cl_kernel kernel = backend_ctx->kernel_moe_histogram;
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &original_router_buf));
@@ -20847,14 +20865,26 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     size_t histogram_local_size[] = {64, 1, 1};
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, histogram_global_size, histogram_local_size, src);
 
-    // Scan
-    kernel = backend_ctx->kernel_moe_scan;
-    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &hist_buf));
-    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &tile_offset_buf));
-    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &total_tiles_buf));
-    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &slot_counter_buf));
-    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n_tile_size));
-    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne02));
+    // Scan / physical-group mapping
+    if (moe_4x8) {
+        kernel = backend_ctx->kernel_moe_scan_4x8;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &hist_buf));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &tile_offset_buf));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &group_map_buf));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &total_tiles_buf));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &slot_counter_buf));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &n_tile_size));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &expert_slot_size));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &ne02));
+    } else {
+        kernel = backend_ctx->kernel_moe_scan;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &hist_buf));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &tile_offset_buf));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &total_tiles_buf));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &slot_counter_buf));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &n_tile_size));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne02));
+    }
 
     size_t scan_global_size[] = {1};
     size_t scan_local_size[] = {1};
@@ -20871,16 +20901,31 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, fill_global_size, fill_local_size, src);
 
     // Scatter
-    kernel = backend_ctx->kernel_moe_scatter;
-    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &original_router_buf));
-    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &post_router_buf));
-    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &emap_buf));
-    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &tile_offset_buf));
-    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &slot_counter_buf));
-    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne21));
-    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne20));
-    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &ne02));
-    CL_CHECK(clSetKernelArg(kernel, 8, sizeof(int), &n_tile_size));
+    if (moe_4x8) {
+        kernel = backend_ctx->kernel_moe_scatter_4x8;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &original_router_buf));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &post_router_buf));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &emap_buf));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &tile_offset_buf));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &group_map_buf));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem), &slot_counter_buf));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne21));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &ne20));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(int), &ne02));
+        CL_CHECK(clSetKernelArg(kernel, 9, sizeof(int), &n_tile_size));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int), &expert_slot_size));
+    } else {
+        kernel = backend_ctx->kernel_moe_scatter;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &original_router_buf));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &post_router_buf));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &emap_buf));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &tile_offset_buf));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &slot_counter_buf));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &ne21));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int), &ne20));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int), &ne02));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(int), &n_tile_size));
+    }
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, histogram_global_size, histogram_local_size, src);
 
@@ -20895,17 +20940,22 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
         const int routings = ne20 * ne21;
         const int ideal    = (routings + n_tile_size - 1) / n_tile_size;
         const int slots     = h_total * n_tile_size;
-        fprintf(stderr, "[MOE_TILES] routings=%d (ne20=%d ne21=%d nexp=%d) total_tiles=%d ideal=%d slots=%d pad=%.1f%%\n",
-                routings, ne20, ne21, ne02, h_total, ideal, slots,
-                routings > 0 ? 100.0 * (slots - routings) / routings : 0.0);
+        fprintf(stderr, "[MOE_TILES] layout=%s routings=%d (ne20=%d ne21=%d nexp=%d) total_tiles=%d ideal=%d slots=%d pad=%.1f%%\n",
+                moe_4x8 ? "4x8" : "1x32", routings, ne20, ne21, ne02, h_total, ideal, slots,
+                 routings > 0 ? 100.0 * (slots - routings) / routings : 0.0);
         fflush(stderr);
     }
 
+    backend_ctx->moe_reorder_4x8 = moe_4x8;
+    
     CL_CHECK(clReleaseMemObject(original_router_buf));
     CL_CHECK(clReleaseMemObject(hist_buf));
     CL_CHECK(clReleaseMemObject(tile_offset_buf));
     CL_CHECK(clReleaseMemObject(total_tiles_buf));
     CL_CHECK(clReleaseMemObject(slot_counter_buf));
+    if (group_map_buf) {
+        CL_CHECK(clReleaseMemObject(group_map_buf));
+    }
     CL_CHECK(clReleaseMemObject(post_router_buf));
     CL_CHECK(clReleaseMemObject(emap_buf));
 }
@@ -21232,14 +21282,26 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                 } else { // for gemm
                     kernel = backend_ctx->kernel_gemm_moe_q4_0_f32_ns;
-                    if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
+                    static const bool q4_0_moe_4x8 = []{
+                        const char * e = getenv("GGML_OPENCL_Q4_0_MOE_4X8");
+                        return e && e[0] != '\0' && atoi(e) != 0;
+                    }();
+                    kernel = q4_0_moe_4x8
+                        ? backend_ctx->kernel_gemm_moe_q4_0_f32_ns_4x8
+                        : backend_ctx->kernel_gemm_moe_q4_0_f32_ns;
+                    if (!q4_0_moe_4x8 && backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
                         kernel = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin;
                     }
 
-                    // Reorder router if called from test-backend-ops or when new router is generated.
-                    // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
-                        moe_router_reoerder(backend, src2, ne20);
+                    const int q4_0_max_post_router_tile = q4_0_moe_4x8
+                        ? ((ne20 * ne21 + 7) / 8) + ne02
+                        : (ne20 * ne21 / n_tile_size) + ne02;
+
+                    // Reorder router if called from test-backend-ops, when a new router is generated,
+                    // or when switching between the legacy 1x32 and Q4_0 4x8 layouts.
+                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder ||
+                        backend_ctx->moe_reorder_4x8 != q4_0_moe_4x8) {
+                        moe_router_reoerder(backend, src2, ne20, q4_0_moe_4x8);
                         backend_ctx->toggle_reorder = false;
                     }
 
@@ -21253,16 +21315,16 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         ? (atoi(q4_0_moe_dp4a_env) != 0)
                         : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
                     // bin kernel takes precedence
-                    use_moe_dp4a = use_moe_dp4a && backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr;
+                    use_moe_dp4a = use_moe_dp4a && !q4_0_moe_4x8 && backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr;
 
                     cl_buffer_region region;
                     region.origin = 0;
-                    region.size = sizeof(int) * max_post_router_tile * n_tile_size;
+                    region.size = sizeof(int) * q4_0_max_post_router_tile * n_tile_size;
                     buf_src2 = clCreateSubBuffer(backend_ctx->prealloc_post_router.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     region.origin = 0;
-                    region.size = sizeof(short) * max_post_router_tile;
+                    region.size = sizeof(short) * q4_0_max_post_router_tile * (q4_0_moe_4x8 ? 4 : 1);
                     buf_src2_emap = clCreateSubBuffer(backend_ctx->prealloc_emap.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
@@ -21280,7 +21342,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         // Create image for reordered src1
                         // Use pre-allocated placeholder
                         region.origin = 0;
-                        region.size = ne00 * max_post_router_tile * n_tile_size * sizeof(float);
+                        region.size = ne00 * q4_0_max_post_router_tile * n_tile_size * sizeof(float);
                         backend_ctx->prealloc_act_trans.allocate(backend_ctx->context, region.size);
                         buf_src1_reordered = clCreateSubBuffer(
                             backend_ctx->prealloc_act_trans.buffer,
@@ -21292,11 +21354,11 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         cl_image_format image_format_buf_src1;
                         cl_image_desc image_desc_buf_src1;
                         image_format_buf_src1 = {CL_RGBA, CL_FLOAT};
-                        image_desc_buf_src1 = {CL_MEM_OBJECT_IMAGE1D_BUFFER, static_cast<size_t>(ne00 * max_post_router_tile * n_tile_size / 4), 0,0,0,0,0,0,0, {buf_src1_reordered}};
-                        if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
+                        image_desc_buf_src1 = {CL_MEM_OBJECT_IMAGE1D_BUFFER, static_cast<size_t>(ne00 * q4_0_max_post_router_tile * n_tile_size / 4), 0,0,0,0,0,0,0, {buf_src1_reordered}};
+                        if (kernel == backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
                             // bin kernel uses slightly different image format
                             image_format_buf_src1 = {CL_R, CL_FLOAT};
-                            image_desc_buf_src1.image_width = static_cast<size_t>(ne00 * max_post_router_tile * n_tile_size);
+                            image_desc_buf_src1.image_width = static_cast<size_t>(ne00 * q4_0_max_post_router_tile * n_tile_size);
                         }
                         image_src1_reordered = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &image_format_buf_src1, &image_desc_buf_src1, NULL, &status);
                         CL_CHECK(status);
@@ -21310,7 +21372,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 6, sizeof(unsigned int),  &n_tile_size));
 
                         size_t reorder_b_local_size[3] = {256, 1, 1};
-                        size_t reorder_b_global_size[3] = {static_cast<size_t>(((ne00 / 4) + 255) / 256 * 256), static_cast<size_t>(max_post_router_tile * n_tile_size), 1};
+                        size_t reorder_b_global_size[3] = {static_cast<size_t>(((ne00 / 4) + 255) / 256 * 256), static_cast<size_t>(q4_0_max_post_router_tile * n_tile_size), 1};
 
                         // Dispatch reorder kernel
                         backend_ctx->enqueue_ndrange_kernel(backend_ctx->kernel_moe_reorder_b, 3, reorder_b_global_size, reorder_b_local_size, dst);
@@ -21334,7 +21396,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(status);
 
                     if (use_moe_dp4a) {
-                        const size_t tok_slots = (size_t)max_post_router_tile * n_tile_size;
+                        const size_t tok_slots = (size_t)q4_0_max_post_router_tile * n_tile_size;
                         const size_t n_blocks  = tok_slots * (ne00 / 32);
                         backend_ctx->prealloc_moe_qa.allocate(backend_ctx->context, tok_slots * ne00 * sizeof(cl_char));
                         backend_ctx->prealloc_moe_da.allocate(backend_ctx->context, n_blocks * sizeof(cl_half));
@@ -21373,7 +21435,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &ne01));
                         CL_CHECK(clSetKernelArg(dk, aidx++, sizeof(int),    &backend_ctx->adreno_use_moe_ragged_dp4));
 
-                        size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
+                        size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)q4_0_max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
                         backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
 
@@ -21401,7 +21463,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // set thread grid
                     global_size[1] = static_cast<size_t>((ne01 + 63) / 64);
-                    global_size[2] = static_cast<size_t>(max_post_router_tile);
+                    global_size[2] = static_cast<size_t>(q4_0_max_post_router_tile);
                     local_size[1] = 1;
                     local_size[2] = 1;
 
@@ -21541,7 +21603,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder || backend_ctx->moe_reorder_4x8) {
                         moe_router_reoerder(backend, src2, ne20);
                         backend_ctx->toggle_reorder = false;
                     }
@@ -21724,7 +21786,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder || backend_ctx->moe_reorder_4x8) {
                         moe_router_reoerder(backend, src2, ne20);
                         backend_ctx->toggle_reorder = false;
                     }
@@ -21977,7 +22039,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder || backend_ctx->moe_reorder_4x8) {
                         moe_router_reoerder(backend, src2, ne20);
                         backend_ctx->toggle_reorder = false;
                     }
@@ -22108,7 +22170,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                 kernel = backend_ctx->kernel_gemm_moe_q8_0_f32_ns;
 
-                if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder || backend_ctx->moe_reorder_4x8) {
                     moe_router_reoerder(backend, src2, ne20);
                     backend_ctx->toggle_reorder = false;
                 }
@@ -22425,7 +22487,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder || backend_ctx->moe_reorder_4x8) {
                         moe_router_reoerder(backend, src2, ne20);
                         backend_ctx->toggle_reorder = false;
                     }
@@ -22673,7 +22735,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder || backend_ctx->moe_reorder_4x8) {
                         moe_router_reoerder(backend, src2, ne20);
                         backend_ctx->toggle_reorder = false;
                     }
@@ -22929,7 +22991,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder || backend_ctx->moe_reorder_4x8) {
                         moe_router_reoerder(backend, src2, ne20);
                         backend_ctx->toggle_reorder = false;
                     }
@@ -23179,7 +23241,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
-                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder) {
+                    if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder || backend_ctx->moe_reorder_4x8) {
                         moe_router_reoerder(backend, src2, ne20);
                         backend_ctx->toggle_reorder = false;
                     }

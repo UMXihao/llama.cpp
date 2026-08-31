@@ -387,3 +387,226 @@ kernel void kernel_moe_q4_0_weight_load_probe(
     // Observable side effect: prevents dead-load elimination.
     sink[block_id_m * TILESIZE_M + get_local_id(0)] = checksum;
 }
+
+// Experimental Q4_0 MoE GEMM for the 4 experts x 8 token packing layout.
+// The work-group geometry is unchanged (64 threads, TILESIZE_N=32). The B tile
+// is loaded once, while each 8-column quarter selects its own expert weights.
+#define Q4_0_DOT_GROUP_4X8(EXPERT_ID, Q_STEP, SCALE, C_REG, LM_OFFSET) do { \
+    const uint _q_sub_offset = row + ((ne01 * (Q_STEP)) >> 3) + (((uint)(EXPERT_ID) * ne00 * ne01) >> 3); \
+    uint2 _q4x16; \
+    _q4x16.x = read_imageui(src0_q, _q_sub_offset + sub_block_id_m).x; \
+    _q4x16.y = read_imageui(src0_q, _q_sub_offset + sub_block_id_m + ne01).x; \
+    dequantize_q4_0(as_ushort4(_q4x16), reg_a, (SCALE)); \
+    dotx8_reduce4(reg_a, shared_b, (C_REG), (LM_OFFSET)); \
+} while (0)
+
+__attribute__((qcom_wave_pair_mode(1)))
+kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
+        __read_only  image1d_buffer_t src0_q,
+        __global     half *           src0_d,
+        __read_only  image1d_buffer_t src1,
+        __global     uint *           src2,
+        __global     ushort *         src2_emap,
+        __write_only image1d_buffer_t dst,
+        __global     int *            total_tiles,
+        uint ne00,
+        uint ne01,
+        uint is_ragged,
+        uint skip_gran
+) {
+    const uint block_id_m = get_global_id(1);
+    const uint block_id_n = get_global_id(2);
+    if (block_id_n >= total_tiles[0]) {
+        return;
+    }
+
+    // This kernel obtains sparsity directly from each 8-slot group. Keep the
+    // two legacy arguments so host-side argument numbering remains identical.
+    (void)is_ragged;
+    (void)skip_gran;
+
+    const uint router_base = block_id_n * TILESIZE_N;
+    const bool active_g0 = src2[router_base +  0] != 0xFFFFFFFFu;
+    const bool active_g1 = src2[router_base +  8] != 0xFFFFFFFFu;
+    const bool active_g2 = src2[router_base + 16] != 0xFFFFFFFFu;
+    const bool active_g3 = src2[router_base + 24] != 0xFFFFFFFFu;
+
+    // Empty groups have no valid emap entry. Never dereference those entries.
+    const ushort expert0 = active_g0 ? src2_emap[block_id_n * 4 + 0] : (ushort)0;
+    const ushort expert1 = active_g1 ? src2_emap[block_id_n * 4 + 1] : (ushort)0;
+    const ushort expert2 = active_g2 ? src2_emap[block_id_n * 4 + 2] : (ushort)0;
+    const ushort expert3 = active_g3 ? src2_emap[block_id_n * 4 + 3] : (ushort)0;
+
+    __private half16 reg_a;
+    __private float32 reg_c = (float32)(0);
+    __local half4 shared_b[128];
+
+    const uint row = block_id_m * TILESIZE_M;
+    const uint col = block_id_n * TILESIZE_N;
+    const uint sub_block_id_m = get_local_id(0);
+
+    uint2 b_global_offset;
+    b_global_offset.x = ((sub_block_id_m & 3) << 2) + (sub_block_id_m >> 2) * ne00;
+    b_global_offset.y = b_global_offset.x + (16 * ne00);
+
+    uint2 b_local_offset;
+    b_local_offset.x = (sub_block_id_m & 3) * 32 + (sub_block_id_m >> 2);
+    b_local_offset.y = b_local_offset.x + 16;
+
+    for (uint step = 0; step < ne00; step += TILESIZE_K * 2) {
+        // A Q4_0 scale covers a full 32-element block, so the same scale is
+        // reused for the first and second 16-K halves of this iteration.
+        const uint scale_step_offset = row + ((ne01 * step) >> 5) + get_global_id(0);
+        const half s0 = active_g0 ? src0_d[scale_step_offset + (((uint)expert0 * ne00 * ne01) >> 5)] : (half)0;
+        const half s1 = active_g1 ? src0_d[scale_step_offset + (((uint)expert1 * ne00 * ne01) >> 5)] : (half)0;
+        const half s2 = active_g2 ? src0_d[scale_step_offset + (((uint)expert2 * ne00 * ne01) >> 5)] : (half)0;
+        const half s3 = active_g3 ? src0_d[scale_step_offset + (((uint)expert3 * ne00 * ne01) >> 5)] : (half)0;
+
+        // First 16-K half: load the whole 32-column B tile once.
+        uint b_sub_offset = col * ne00 + step;
+        float8 bx8_f32;
+        bx8_f32.lo = read_imagef(src1, (b_sub_offset + b_global_offset.x) / 4);
+        bx8_f32.hi = read_imagef(src1, (b_sub_offset + b_global_offset.y) / 4);
+        half8 bx8_f16 = convert_half8(bx8_f32);
+        shared_b[b_local_offset.x] = bx8_f16.lo;
+        shared_b[b_local_offset.y] = bx8_f16.hi;
+        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+
+        half8 acc8;
+        if (active_g0) { Q4_0_DOT_GROUP_4X8(expert0, step, s0, reg_c.lo.lo,  0); }
+        if (active_g1) { Q4_0_DOT_GROUP_4X8(expert1, step, s1, reg_c.lo.hi,  8); }
+        if (active_g2) { Q4_0_DOT_GROUP_4X8(expert2, step, s2, reg_c.hi.lo, 16); }
+        if (active_g3) { Q4_0_DOT_GROUP_4X8(expert3, step, s3, reg_c.hi.hi, 24); }
+
+        // Second 16-K half.
+        const uint half_step = step + TILESIZE_K;
+        b_sub_offset = col * ne00 + half_step;
+        bx8_f32.lo = read_imagef(src1, (b_sub_offset + b_global_offset.x) / 4);
+        bx8_f32.hi = read_imagef(src1, (b_sub_offset + b_global_offset.y) / 4);
+        bx8_f16 = convert_half8(bx8_f32);
+        shared_b[b_local_offset.x] = bx8_f16.lo;
+        shared_b[b_local_offset.y] = bx8_f16.hi;
+        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (active_g0) { Q4_0_DOT_GROUP_4X8(expert0, half_step, s0, reg_c.lo.lo,  0); }
+        if (active_g1) { Q4_0_DOT_GROUP_4X8(expert1, half_step, s1, reg_c.lo.hi,  8); }
+        if (active_g2) { Q4_0_DOT_GROUP_4X8(expert2, half_step, s2, reg_c.hi.lo, 16); }
+        if (active_g3) { Q4_0_DOT_GROUP_4X8(expert3, half_step, s3, reg_c.hi.hi, 24); }
+    }
+    
+    // Share the post-router once per work-group. All work-items must reach the
+    // barrier, including the lanes outside ne01 in the last M tile.
+    __local uint out_idx[TILESIZE_N];
+    if (get_local_id(0) < TILESIZE_N) {
+        out_idx[get_local_id(0)] = src2[router_base + get_local_id(0)];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const uint m_offset = row + get_local_id(0);
+    if (m_offset >= ne01) {
+        return;
+    }
+
+    // qcom_extra_vector_types float32 exposes named components s0..sv but is
+    // not subscriptable on the Qualcomm OpenCL compiler. Also, unlike the
+    // legacy 1x32 kernel, padding must not alias slot 0 because each 8-column
+    // quarter can belong to a different expert.
+    if (out_idx[0] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[0] * ne01 + m_offset, (reg_c.s0));
+    }
+    if (out_idx[1] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[1] * ne01 + m_offset, (reg_c.s1));
+    }
+    if (out_idx[2] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[2] * ne01 + m_offset, (reg_c.s2));
+    }
+    if (out_idx[3] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[3] * ne01 + m_offset, (reg_c.s3));
+    }
+    if (out_idx[4] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[4] * ne01 + m_offset, (reg_c.s4));
+    }
+    if (out_idx[5] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[5] * ne01 + m_offset, (reg_c.s5));
+    }
+    if (out_idx[6] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[6] * ne01 + m_offset, (reg_c.s6));
+    }
+    if (out_idx[7] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[7] * ne01 + m_offset, (reg_c.s7));
+    }
+    if (out_idx[8] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[8] * ne01 + m_offset, (reg_c.s8));
+    }
+    if (out_idx[9] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[9] * ne01 + m_offset, (reg_c.s9));
+    }
+    if (out_idx[10] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[10] * ne01 + m_offset, (reg_c.sa));
+    }
+    if (out_idx[11] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[11] * ne01 + m_offset, (reg_c.sb));
+    }
+    if (out_idx[12] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[12] * ne01 + m_offset, (reg_c.sc));
+    }
+    if (out_idx[13] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[13] * ne01 + m_offset, (reg_c.sd));
+    }
+    if (out_idx[14] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[14] * ne01 + m_offset, (reg_c.se));
+    }
+    if (out_idx[15] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[15] * ne01 + m_offset, (reg_c.sf));
+    }
+    if (out_idx[16] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[16] * ne01 + m_offset, (reg_c.sg));
+    }
+    if (out_idx[17] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[17] * ne01 + m_offset, (reg_c.sh));
+    }
+    if (out_idx[18] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[18] * ne01 + m_offset, (reg_c.si));
+    }
+    if (out_idx[19] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[19] * ne01 + m_offset, (reg_c.sj));
+    }
+    if (out_idx[20] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[20] * ne01 + m_offset, (reg_c.sk));
+    }
+    if (out_idx[21] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[21] * ne01 + m_offset, (reg_c.sl));
+    }
+    if (out_idx[22] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[22] * ne01 + m_offset, (reg_c.sm));
+    }
+    if (out_idx[23] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[23] * ne01 + m_offset, (reg_c.sn));
+    }
+    if (out_idx[24] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[24] * ne01 + m_offset, (reg_c.so));
+    }
+    if (out_idx[25] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[25] * ne01 + m_offset, (reg_c.sp));
+    }
+    if (out_idx[26] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[26] * ne01 + m_offset, (reg_c.sq));
+    }
+    if (out_idx[27] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[27] * ne01 + m_offset, (reg_c.sr));
+    }
+    if (out_idx[28] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[28] * ne01 + m_offset, (reg_c.ss));
+    }
+    if (out_idx[29] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[29] * ne01 + m_offset, (reg_c.st));
+    }
+    if (out_idx[30] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[30] * ne01 + m_offset, (reg_c.su));
+    }
+    if (out_idx[31] != 0xFFFFFFFFu) {
+        write_imagef(dst, out_idx[31] * ne01 + m_offset, (reg_c.sv));
+    }
+}
+
+#undef Q4_0_DOT_GROUP_4X8

@@ -245,11 +245,11 @@ cmake --build build-android --config Release -j 22
 
 mkdir bandwidth
 
-cmake --install build-android --prefix tile/ --config Release
+cmake --install build-android --prefix multiex/ --config Release
 
-adb push bandwidth/ /data/local/tmp/
+adb push multiex/ /data/local/tmp/
 
-LD_LIBRARY_PATH=lib ./bin/llama-completion -m ../models/deepseek-v2-lite-chat-q4_0.gguf -n 10 -no-cnv -f ../models/fix-token.txt -ngl 30 --n-cpu-moe 30 -v
+LD_LIBRARY_PATH=lib ./bin/llama-completion -m ../models/deepseek-v2-lite-chat-q4_0.gguf -n 10 -no-cnv -f ../models/fix-token.txt -ngl 30 -v
 
 W=OpenCL#ffn_moe_down-9#0 bytes=6635520 queue=240.000 us submit=27.000 us transfer=10.000 us ocl_total=277.000 us cpu_wall=281.000 us BW=663.552 GB/s
 W=OpenCL#ffn_moe_down-9#0 bytes=49152 queue=5352.400 us submit=385.700 us transfer=8.400 us ocl_total=5746.500 us cpu_wall=5825.000 us BW=5.851 GB/s
