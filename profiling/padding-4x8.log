@@ -1,0 +1,53 @@
+[MOE_TILES[MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=104 ideal=96 slots=3328 pad=8.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=104 ideal=96 slots=3328 pad=8.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=104 ideal=96 slots=3328 pad=8.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=104 ideal=96 slots=3328 pad=8.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=104 ideal=96 slots=3328 pad=8.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=105 ideal=96 slots=3360 pad=9.4%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=104 ideal=96 slots=3328 pad=8.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=104 ideal=96 slots=3328 pad=8.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=104 ideal=96 slots=3328 pad=8.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=104 ideal=96 slots=3328 pad=8.3%
+          [MOE_TILES] layout=4x8 routings=3072 (ne20=6 ne21=512 nexp=64) total_tiles=103 ideal=96 slots=3296 pad=7.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=30 ideal=25 slots=960 pad=24.0%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=30 ideal=25 slots=960 pad=24.0%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=31 ideal=25 slots=992 pad=28.2%
+          [MOE_TILES] layout=4x8 routings=774 (ne20=6 ne21=129 nexp=64) total_tiles=32 ideal=25 slots=1024 pad=32.3%
+
+
+0.55.845.446 I common_perf_print: prompt eval time =    4297.31 ms /   641 tokens (    6.70 ms per token,   149.16 tokens per second)
+0.55.845.449 I common_perf_print:        eval time =     406.23 ms /     9 runs   (   45.14 ms per token,    22.15 tokens per second)

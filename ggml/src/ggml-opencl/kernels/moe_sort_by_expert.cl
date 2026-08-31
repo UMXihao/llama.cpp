@@ -82,11 +82,44 @@ __kernel void kernel_moe_fill(
     }
 }
 
-// Q4_0 experimental MoE packing: one 32-slot physical tile contains up to
-// four different experts, each owning one contiguous 8-slot group.
-//
+// Q4_0 experimental MoE packing: one 32-slot physical tile contains four
+// contiguous 8-slot groups. Packing minimizes physical tiles first and expert
+// runs second, so common patterns are 4, 3+1, 2+2, 2+1+1 and 1+1+1+1.
 // The legacy kernel_moe_fill is intentionally reused unchanged: it initializes
 // every physical slot to 0xFFFFFFFF before scatter fills the valid positions.
+inline int moe_find_remaining_4x8(
+        __global const int * remaining,
+        uint n_experts,
+        int want,
+        int exclude0,
+        int exclude1,
+        int exclude2) {
+    for (int e = 0; e < (int)n_experts; ++e) {
+        if (e == exclude0 || e == exclude1 || e == exclude2) {
+            continue;
+        }
+        if (remaining[e] == want) {
+            return e;
+        }
+    }
+    return -1;
+}
+
+inline int moe_map_take_4x8(
+        __global int * group_map,
+        __global const int * group_offset,
+        __global int * mapped_groups,
+        int expert,
+        int take,
+        int physical_group) {
+    const int logical_base = group_offset[expert] + mapped_groups[expert];
+    for (int i = 0; i < take; ++i) {
+        group_map[logical_base + i] = physical_group + i;
+    }
+    mapped_groups[expert] += take;
+    return physical_group + take;
+}
+
 __kernel void kernel_moe_scan_4x8(
     __global int * hist,
     __global int * group_offset,
@@ -99,55 +132,148 @@ __kernel void kernel_moe_scan_4x8(
 ) {
     const int groups_per_tile = tile_size / expert_slot_size;
 
-    int logical_groups = 0;
-    int max_groups = 0;
+    // This packing policy is intentionally specialized for 32 = 4 x 8.
+    if (groups_per_tile != 4) {
+        *total_tiles = 0;
+        return;
+    }
 
-    // group_offset[e] is the first logical 8-token group for expert e.
-    // Keep hist intact until the physical round-robin mapping is built.
-    for (int e = 0; e < n_experts; ++e) {
+    int logical_groups = 0;
+    for (int e = 0; e < (int)n_experts; ++e) {
         const int count = hist[e];
         const int groups = (count + expert_slot_size - 1) / expert_slot_size;
 
         group_offset[e] = logical_groups;
         logical_groups += groups;
-        if (groups > max_groups) {
-            max_groups = groups;
-        }
+
+        // During scan hist[] is reused as the number of groups not yet packed,
+        // and slot_counter[] as the number already mapped for this expert.
+        hist[e] = groups;
         slot_counter[e] = 0;
     }
 
-    // Pack one group per active expert in each round. A round always starts on
-    // a fresh physical tile, therefore the same expert can never occupy two of
-    // the four 8-token groups in one tile.
     int physical_group = 0;
-    for (int round = 0; round < max_groups; ++round) {
-        int groups_in_tile = 0;
+    // 1) Four groups from one expert are ideal: no padding and one weight load.
+    for (int e = 0; e < (int)n_experts; ++e) {
+        while (hist[e] >= 4) {
+            physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e, 4, physical_group);
+            hist[e] -= 4;
+        }
+    }
 
-        for (int e = 0; e < n_experts; ++e) {
-            const int groups = (hist[e] + expert_slot_size - 1) / expert_slot_size;
-            if (round >= groups) {
-                continue;
+    // 2) Pack whole remainders into exact 4-group tiles. The order favors the
+    //    requested low-weight-load patterns: 3+1 and 2+2 before 3/4-expert tiles.
+    while (1) {
+        const int e3 = moe_find_remaining_4x8(hist, n_experts, 3, -1, -1, -1);
+        const int e1 = moe_find_remaining_4x8(hist, n_experts, 1, e3, -1, -1);
+        if (e3 < 0 || e1 < 0) {
+            break;
+        }
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e3, 3, physical_group);
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e1, 1, physical_group);
+        hist[e3] = 0;
+        hist[e1] = 0;
+    }
+
+    while (1) {
+        const int e20 = moe_find_remaining_4x8(hist, n_experts, 2, -1, -1, -1);
+        const int e21 = moe_find_remaining_4x8(hist, n_experts, 2, e20, -1, -1);
+        if (e20 < 0 || e21 < 0) {
+            break;
+        }
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e20, 2, physical_group);
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e21, 2, physical_group);
+        hist[e20] = 0;
+        hist[e21] = 0;
+    }
+
+    while (1) {
+        const int e2 = moe_find_remaining_4x8(hist, n_experts, 2, -1, -1, -1);
+        const int e10 = moe_find_remaining_4x8(hist, n_experts, 1, e2, -1, -1);
+        const int e11 = moe_find_remaining_4x8(hist, n_experts, 1, e2, e10, -1);
+        if (e2 < 0 || e10 < 0 || e11 < 0) {
+            break;
+        }
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e2, 2, physical_group);
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e10, 1, physical_group);
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e11, 1, physical_group);
+        hist[e2] = 0;
+        hist[e10] = 0;
+        hist[e11] = 0;
+    }
+
+    while (1) {
+        const int e0 = moe_find_remaining_4x8(hist, n_experts, 1, -1, -1, -1);
+        const int e1 = moe_find_remaining_4x8(hist, n_experts, 1, e0, -1, -1);
+        const int e2 = moe_find_remaining_4x8(hist, n_experts, 1, e0, e1, -1);
+        const int e3 = moe_find_remaining_4x8(hist, n_experts, 1, e0, e1, e2);
+        if (e0 < 0 || e1 < 0 || e2 < 0 || e3 < 0) {
+            break;
+        }
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e0, 1, physical_group);
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e1, 1, physical_group);
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e2, 1, physical_group);
+        physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e3, 1, physical_group);
+        hist[e0] = 0;
+        hist[e1] = 0;
+        hist[e2] = 0;
+        hist[e3] = 0;
+    }
+
+    // 3) If exact whole-remainder combinations are exhausted, fill the minimum
+    //    number of remaining tiles. Split an expert remainder only when needed
+    //    to fill a non-final tile. Within every tile each expert stays contiguous.
+    int remaining_groups = 0;
+    for (int e = 0; e < (int)n_experts; ++e) {
+        remaining_groups += hist[e];
+    }
+    while (remaining_groups > 0) {
+        int capacity = min(4, remaining_groups);
+
+        while (capacity > 0 && remaining_groups > 0) {
+            int expert = moe_find_remaining_4x8(hist, n_experts, capacity, -1, -1, -1);
+            int take = capacity;
+
+            if (expert < 0) {
+                // Prefer consuming a whole remainder that fits, largest first.
+                int best_groups = 0;
+                for (int e = 0; e < (int)n_experts; ++e) {
+                    const int groups = hist[e];
+                    if (groups > best_groups && groups <= capacity) {
+                        best_groups = groups;
+                        expert = e;
+                    }
+                }
+                if (expert >= 0) {
+                    take = hist[expert];
+                } else {
+                    // Every remaining expert is larger than the free space.
+                    // Splitting here is required to achieve ceil(groups/4) tiles.
+                    int largest_groups = 0;
+                    for (int e = 0; e < (int)n_experts; ++e) {
+                        if (hist[e] > largest_groups) {
+                            largest_groups = hist[e];
+                            expert = e;
+                        }
+                    }
+                    take = capacity;
+                }
             }
-
-            const int logical_group = group_offset[e] + round;
-            group_map[logical_group] = physical_group++;
-
-            ++groups_in_tile;
-            if (groups_in_tile == groups_per_tile) {
-                groups_in_tile = 0;
-            }
+            physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, expert, take, physical_group);
+            hist[expert] -= take;
+            capacity -= take;
+            remaining_groups -= take;
         }
 
-        if (groups_in_tile != 0) {
-            physical_group += groups_per_tile - groups_in_tile;
+        // Only the final partial tile should normally need this padding.
+        if ((physical_group & 3) != 0) {
+            physical_group += 4 - (physical_group & 3);
         }
     }
 
     *total_tiles = physical_group / groups_per_tile;
 
-    // Preserve the legacy behavior: histogram and slot counters are ready for
-    // the next router reorder invocation.
-    for (int e = 0; e < n_experts; ++e) {
+    for (int e = 0; e < (int)n_experts; ++e) {
         hist[e] = 0;
         slot_counter[e] = 0;
     }
