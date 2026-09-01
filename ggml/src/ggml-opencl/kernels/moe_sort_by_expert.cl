@@ -47,7 +47,8 @@ __kernel void kernel_moe_scatter(
     __global int * slot_counter,
     int N,
     int topK,
-    uint n_experts
+    uint n_experts,
+    int tile_size
 ) {
     uint n = get_global_id(0);
     uint k = get_global_id(1);
@@ -60,9 +61,9 @@ __kernel void kernel_moe_scatter(
 
     int local_slot = atomic_inc(&slot_counter[val]);
 
-    int tile_idx  = tile_offset[val] + (local_slot / 32);
-    int lane      = local_slot % 32;
-    int out_pos   = tile_idx * 32 + lane;
+    int tile_idx  = tile_offset[val] + (local_slot / tile_size);
+    int lane      = local_slot % tile_size;
+    int out_pos   = tile_idx * tile_size + lane;
 
     post_router[out_pos] = n * topK + k;
     emap[tile_idx] = val;

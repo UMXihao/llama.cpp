@@ -6,7 +6,7 @@
 
 #define TILESIZE_K 16
 #define TILESIZE_M 64
-#define TILESIZE_N 32
+#define TILESIZE_N 16
 
 
 #define dequantize_q4_0(q4, a_f16, scale) \
@@ -180,11 +180,9 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
     }
     // Group 0 (cols 0-7) always runs; groups 1-3 skip when fully padding.
     bool skip_g1 = (8u  >= n_active);
-    bool skip_g2 = (16u >= n_active);
-    bool skip_g3 = (24u >= n_active);
 
     __private half16 reg_a;
-    __private float32 reg_c = (float32)(0);
+    __private float16 reg_c = (float16)(0);
     __local half4 shared_b[128];
 
     const ushort expert_id = src2_emap[block_id_n];
@@ -193,13 +191,8 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
     const uint col = block_id_n * TILESIZE_N;
 
     uint sub_block_id_m = get_local_id(0);
-    uint2 b_global_offset;
-    b_global_offset.x = ((sub_block_id_m & 3) << 2) + (sub_block_id_m >> 2) * ne00;
-    b_global_offset.y = b_global_offset.x + (16 * ne00);
-    uint2 b_local_offset;
-    b_local_offset.x = (sub_block_id_m & 3) * 32 + (sub_block_id_m >> 2);
-    b_local_offset.y = b_local_offset.x + 16;
-
+    uint b_global_offset = ((sub_block_id_m & 3) << 2) + (sub_block_id_m >> 2) * ne00;
+    uint b_local_offset  = (sub_block_id_m & 3) * 32 + (sub_block_id_m >> 2);
     // Loop along K axis, 32 elements (one block) for each iteration, divided into 2 sub-blocks
     for (uint step = 0; step < ne00; step += TILESIZE_K * 2) {
         // First sub-block
@@ -216,14 +209,11 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
         q4x16.x = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
         q4x16.y = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
 
-        // Load 16x32 floats from matrix B, each fiber out of 64 in a sub-group loads 8 elements
-        float8 bx8_f32;
-        bx8_f32.lo = read_imagef(src1, (b_sub_offset + b_global_offset.x) / 4);
-        bx8_f32.hi = read_imagef(src1, (b_sub_offset + b_global_offset.y) / 4);
-        // Convert to half and store to LM to share within the subgroup
-        half8 bx8_f16 = convert_half8(bx8_f32);
-        shared_b[b_local_offset.x] = bx8_f16.lo;
-        shared_b[b_local_offset.y] = bx8_f16.hi;
+        // Load 16x16 floats from matrix B. Keep the original LM stride (32)
+        // so dotx8_reduce4 does not need a different reduction layout.
+        float4 bx4_f32 = read_imagef(src1, (b_sub_offset + b_global_offset) / 4);
+        half4 bx4_f16 = convert_half4(bx4_f32);
+        shared_b[b_local_offset] = bx4_f16;
 
         // Dequantization
         dequantize_q4_0(as_ushort4(q4x16), reg_a, s);
@@ -232,10 +222,8 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
 
         // 32 16x16 fp16 dot product with 8 elements reduction for better precision
         half8 acc8;
-        dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
-        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8); }
-        if (!skip_g2) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16); }
-        if (!skip_g3) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24); }
+        dotx8_reduce4(reg_a, shared_b, reg_c.lo, 0);
+        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.hi, 8); }
 
         // Repeat for second sub-block
         uint half_step = step + TILESIZE_K;
@@ -247,12 +235,9 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
         q4x16.y = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
 
         // Load 16x32 floats from matrix B, each fiber out of 64 in a sub-group loads 8 elements
-        bx8_f32.lo = read_imagef(src1, (b_sub_offset + b_global_offset.x) / 4);
-        bx8_f32.hi = read_imagef(src1, (b_sub_offset + b_global_offset.y) / 4);
-        // Convert to half and store to LM to share within the subgroup
-        bx8_f16 = convert_half8(bx8_f32);
-        shared_b[b_local_offset.x] = bx8_f16.lo;
-        shared_b[b_local_offset.y] = bx8_f16.hi;
+        bx4_f32 = read_imagef(src1, (b_sub_offset + b_global_offset) / 4);
+        bx4_f16 = convert_half4(bx4_f32);
+        shared_b[b_local_offset] = bx4_f16;
 
         // Dequantization
         dequantize_q4_0(as_ushort4(q4x16), reg_a, s);
@@ -260,10 +245,8 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
         // 32 16x16 fp16 dot product with 3-levels reduction for better precision
-        dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
-        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8); }
-        if (!skip_g2) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16); }
-        if (!skip_g3) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24); }
+        dotx8_reduce4(reg_a, shared_b, reg_c.lo, 0);
+        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.hi, 8); }
     }
 
     if ((get_global_id(0) + block_id_m * TILESIZE_M) >= ne01) {
@@ -301,22 +284,6 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
     write_imagef(dst, out_idx[13] + m_offset, (reg_c.sd));
     write_imagef(dst, out_idx[14] + m_offset, (reg_c.se));
     write_imagef(dst, out_idx[15] + m_offset, (reg_c.sf));
-    write_imagef(dst, out_idx[16] + m_offset, (reg_c.sg));
-    write_imagef(dst, out_idx[17] + m_offset, (reg_c.sh));
-    write_imagef(dst, out_idx[18] + m_offset, (reg_c.si));
-    write_imagef(dst, out_idx[19] + m_offset, (reg_c.sj));
-    write_imagef(dst, out_idx[20] + m_offset, (reg_c.sk));
-    write_imagef(dst, out_idx[21] + m_offset, (reg_c.sl));
-    write_imagef(dst, out_idx[22] + m_offset, (reg_c.sm));
-    write_imagef(dst, out_idx[23] + m_offset, (reg_c.sn));
-    write_imagef(dst, out_idx[24] + m_offset, (reg_c.so));
-    write_imagef(dst, out_idx[25] + m_offset, (reg_c.sp));
-    write_imagef(dst, out_idx[26] + m_offset, (reg_c.sq));
-    write_imagef(dst, out_idx[27] + m_offset, (reg_c.sr));
-    write_imagef(dst, out_idx[28] + m_offset, (reg_c.ss));
-    write_imagef(dst, out_idx[29] + m_offset, (reg_c.st));
-    write_imagef(dst, out_idx[30] + m_offset, (reg_c.su));
-    write_imagef(dst, out_idx[31] + m_offset, (reg_c.sv));
 
     // Store zero padding parts to the index of first output in tile, override correct result in the end
     barrier(CLK_GLOBAL_MEM_FENCE);
