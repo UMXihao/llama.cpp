@@ -6,7 +6,7 @@
 
 #define TILESIZE_K 16
 #define TILESIZE_M 64
-#define TILESIZE_N 16
+#define TILESIZE_N 8
 
 
 #define dequantize_q4_0(q4, a_f16, scale) \
@@ -179,10 +179,10 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
         n_active = min((uint)TILESIZE_N, ((n_valid + skip_gran - 1) / skip_gran) * skip_gran);
     }
     // Group 0 (cols 0-7) always runs; groups 1-3 skip when fully padding.
-    bool skip_g1 = (8u  >= n_active);
+    bool skip_g0 = (0u >= n_active);
 
     __private half16 reg_a;
-    __private float16 reg_c = (float16)(0);
+    __private float8 reg_c = (float8)(0);
     __local half4 shared_b[128];
 
     const ushort expert_id = src2_emap[block_id_n];
@@ -211,9 +211,10 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
 
         // Load 16x16 floats from matrix B. Keep the original LM stride (32)
         // so dotx8_reduce4 does not need a different reduction layout.
-        float4 bx4_f32 = read_imagef(src1, (b_sub_offset + b_global_offset) / 4);
-        half4 bx4_f16 = convert_half4(bx4_f32);
-        shared_b[b_local_offset] = bx4_f16;
+        if (sub_block_id_m < TILESIZE_N * 4) {
+            float4 bx4_f32 = read_imagef(src1, (b_sub_offset + b_global_offset) / 4);
+            shared_b[b_local_offset] = convert_half4(bx4_f32);
+        }
 
         // Dequantization
         dequantize_q4_0(as_ushort4(q4x16), reg_a, s);
@@ -222,8 +223,7 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
 
         // 32 16x16 fp16 dot product with 8 elements reduction for better precision
         half8 acc8;
-        dotx8_reduce4(reg_a, shared_b, reg_c.lo, 0);
-        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.hi, 8); }
+        if (!skip_g0) { dotx8_reduce4(reg_a, shared_b, reg_c, 0); }
 
         // Repeat for second sub-block
         uint half_step = step + TILESIZE_K;
@@ -234,19 +234,17 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
         q4x16.x = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
         q4x16.y = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
 
-        // Load 16x32 floats from matrix B, each fiber out of 64 in a sub-group loads 8 elements
-        bx4_f32 = read_imagef(src1, (b_sub_offset + b_global_offset) / 4);
-        bx4_f16 = convert_half4(bx4_f32);
-        shared_b[b_local_offset] = bx4_f16;
+        if (sub_block_id_m < TILESIZE_N * 4) {
+            float4 bx4_f32 = read_imagef(src1, (b_sub_offset + b_global_offset) / 4);
+            shared_b[b_local_offset] = convert_half4(bx4_f32);
+        }
 
         // Dequantization
         dequantize_q4_0(as_ushort4(q4x16), reg_a, s);
 
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
-        // 32 16x16 fp16 dot product with 3-levels reduction for better precision
-        dotx8_reduce4(reg_a, shared_b, reg_c.lo, 0);
-        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.hi, 8); }
+        if (!skip_g0) { dotx8_reduce4(reg_a, shared_b, reg_c, 0); }
     }
 
     if ((get_global_id(0) + block_id_m * TILESIZE_M) >= ne01) {
@@ -276,14 +274,6 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
     write_imagef(dst, out_idx[5] + m_offset, (reg_c.s5));
     write_imagef(dst, out_idx[6] + m_offset, (reg_c.s6));
     write_imagef(dst, out_idx[7] + m_offset, (reg_c.s7));
-    write_imagef(dst, out_idx[8] + m_offset, (reg_c.s8));
-    write_imagef(dst, out_idx[9] + m_offset, (reg_c.s9));
-    write_imagef(dst, out_idx[10] + m_offset, (reg_c.sa));
-    write_imagef(dst, out_idx[11] + m_offset, (reg_c.sb));
-    write_imagef(dst, out_idx[12] + m_offset, (reg_c.sc));
-    write_imagef(dst, out_idx[13] + m_offset, (reg_c.sd));
-    write_imagef(dst, out_idx[14] + m_offset, (reg_c.se));
-    write_imagef(dst, out_idx[15] + m_offset, (reg_c.sf));
 
     // Store zero padding parts to the index of first output in tile, override correct result in the end
     barrier(CLK_GLOBAL_MEM_FENCE);
