@@ -132,8 +132,8 @@ __kernel void kernel_moe_scan_4x8(
 ) {
     const int groups_per_tile = tile_size / expert_slot_size;
 
-    // The grouped router supports 32 = 4 x 8 and 32 = 2 x 16.
-    if (groups_per_tile != 4 && groups_per_tile != 2) {
+    // The grouped router supports 32 = 8 x 4, 4 x 8 and 2 x 16.
+    if (groups_per_tile != 8 && groups_per_tile != 4 && groups_per_tile != 2) {
         total_tiles[0] = 0;
         return;
     }
@@ -146,8 +146,11 @@ __kernel void kernel_moe_scan_4x8(
 
         group_offset[e] = logical_groups;
         logical_groups += groups;
-        // Q4_0 still executes 8-column microkernels even when the router slot is 16.
-        dot8_groups += (count + 7) / 8;
+        // 8/16-token layouts execute only dotx8. The 4-token layout derives
+        // dotx8/dotx4 counts from the final packed expert runs below.
+        if (expert_slot_size >= 8) {
+            dot8_groups += (count + 7) / 8;
+        }
 
         // During scan hist[] is reused as the number of groups not yet packed,
         // and slot_counter[] as the number already mapped for this expert.
@@ -156,6 +159,135 @@ __kernel void kernel_moe_scan_4x8(
     }
 
     int physical_group = 0;
+    // 8x4: first consume full 8-group / 32-token expert tiles, then greedily
+    // pack the remaining 1..7 group remainders. We always fill a non-final
+    // tile to capacity, splitting an expert remainder only when no whole
+    // remainder fits. This achieves ceil(total_groups / 8) physical tiles while
+    // preferring fewer expert runs and keeping each run contiguous.
+    if (groups_per_tile == 8) {
+        for (int e = 0; e < (int)n_experts; ++e) {
+            while (hist[e] >= 8) {
+                physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, e, 8, physical_group);
+                hist[e] -= 8;
+            }
+        }
+
+        int remaining_groups_8x4 = 0;
+        for (int e = 0; e < (int)n_experts; ++e) {
+            remaining_groups_8x4 += hist[e];
+        }
+
+        while (remaining_groups_8x4 > 0) {
+            int capacity = min(8, remaining_groups_8x4);
+
+            while (capacity > 0 && remaining_groups_8x4 > 0) {
+                int expert = -1;
+                int take = 0;
+
+                // Prefer an exact whole remainder, then the largest whole
+                // remainder that fits the free space.
+                for (int e = 0; e < (int)n_experts; ++e) {
+                    if (hist[e] == capacity) {
+                        expert = e;
+                        take = capacity;
+                        break;
+                    }
+                }
+                if (expert < 0) {
+                    int best_groups = 0;
+                    for (int e = 0; e < (int)n_experts; ++e) {
+                        if (hist[e] > best_groups && hist[e] <= capacity) {
+                            best_groups = hist[e];
+                            expert = e;
+                        }
+                    }
+                    if (expert >= 0) {
+                        take = hist[expert];
+                    }
+                }
+
+                if (expert < 0) {
+                    // All remaining remainders are larger than the free space;
+                    // split the largest one. This is required to keep the tile
+                    // count at the theoretical minimum.
+                    int largest_groups = 0;
+                    for (int e = 0; e < (int)n_experts; ++e) {
+                        if (hist[e] > largest_groups) {
+                            largest_groups = hist[e];
+                            expert = e;
+                        }
+                    }
+                    take = capacity;
+                }
+
+                physical_group = moe_map_take_4x8(group_map, group_offset, slot_counter, expert, take, physical_group);
+                hist[expert] -= take;
+                capacity -= take;
+                remaining_groups_8x4 -= take;
+            }
+
+            if ((physical_group & 7) != 0) {
+                physical_group += 8 - (physical_group & 7);
+            }
+        }
+
+        // Derive expert-run and hybrid dotx8/dotx4 counts from the exact final
+        // mapping. Two adjacent 4-token groups in the same expert run are fused
+        // into one dotx8; an odd run tail uses one dotx4.
+        int expert_runs_8x4 = 0;
+        int dot8_groups_8x4 = 0;
+        int dot4_groups_8x4 = 0;
+        for (int e = 0; e < (int)n_experts; ++e) {
+            const int mapped = slot_counter[e];
+            if (mapped <= 0) {
+                continue;
+            }
+
+            int run_start = 0;
+            while (run_start < mapped) {
+                ++expert_runs_8x4;
+                int run_end = run_start + 1;
+                while (run_end < mapped) {
+                    const int prev = group_map[group_offset[e] + run_end - 1];
+                    const int cur  = group_map[group_offset[e] + run_end];
+                    const bool contiguous = (cur == prev + 1) &&
+                                            ((cur / groups_per_tile) == (prev / groups_per_tile));
+                    if (!contiguous) {
+                        break;
+                    }
+                    ++run_end;
+                }
+                int i = run_start;
+                while (i < run_end) {
+                    const int pos = group_map[group_offset[e] + i];
+                    const bool aligned_pair = ((pos & 1) == 0) &&
+                                              (i + 1 < run_end) &&
+                                              (group_map[group_offset[e] + i + 1] == pos + 1);
+                    if (aligned_pair) {
+                        ++dot8_groups_8x4;
+                        i += 2;
+                    } else {
+                        ++dot4_groups_8x4;
+                        ++i;
+                    }
+                }
+                run_start = run_end;
+            }
+        }
+
+        total_tiles[0] = physical_group / groups_per_tile;
+        total_tiles[1] = logical_groups;
+        total_tiles[2] = expert_runs_8x4;
+        total_tiles[3] = dot8_groups_8x4;
+        total_tiles[4] = dot4_groups_8x4;
+
+        for (int e = 0; e < (int)n_experts; ++e) {
+            hist[e] = 0;
+            slot_counter[e] = 0;
+        }
+        return;
+    }
+
     // 2x16: consume two 16-token groups from the same expert whenever possible.
     // This makes a full 32-token tile use one expert/weight run. Any odd remainders
     // are then paired across experts; only the final odd remainder is padded.
@@ -200,6 +332,7 @@ __kernel void kernel_moe_scan_4x8(
         total_tiles[1] = logical_groups;
         total_tiles[2] = expert_runs_2x16;
         total_tiles[3] = dot8_groups;
+        total_tiles[4] = 0;
 
         for (int e = 0; e < (int)n_experts; ++e) {
             hist[e] = 0;
@@ -357,6 +490,7 @@ __kernel void kernel_moe_scan_4x8(
     total_tiles[1] = logical_groups;
     total_tiles[2] = expert_runs;
     total_tiles[3] = dot8_groups;
+    total_tiles[4] = 0;
 
     for (int e = 0; e < (int)n_experts; ++e) {
         hist[e] = 0;
@@ -398,7 +532,7 @@ __kernel void kernel_moe_scatter_4x8(
 
     post_router[tile_idx * tile_size + lane] = n * topK + k;
 
-    // emap is indexed by physical expert group: 4 entries/tile for 4x8, 2 for 2x16.
+    // emap is indexed by physical expert group: 8 entries/tile for 8x4, 4 for 4x8, 2 for 2x16.
     // Multiple lanes of the same group store the same expert id, matching the
     // benign same-value race used by the legacy per-tile emap scatter.
     emap[physical_group] = (ushort)expert_id;

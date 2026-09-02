@@ -750,6 +750,7 @@ struct ggml_backend_opencl_context {
     // the cached router is using a grouped Q4_0 layout (4x8 or 2x16).
     bool moe_reorder_4x8 = false;
     int moe_reorder_slot_size = 32;
+    uint64_t moe_router_generation = 0;
     ggml_cl_buffer prealloc_post_router;
     ggml_cl_buffer prealloc_emap;
     ggml_cl_buffer prealloc_hist;
@@ -758,6 +759,18 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_slot_counter;
     ggml_cl_buffer prealloc_group_map;
 
+    // One-shot Q4_0 grouped activation-reorder cache. gate_exps and up_exps
+    // normally consume the same activation/router, so up can reuse gate's
+    // reordered activation without launching kernel_moe_reorder_b a second time.
+    bool     moe_q4_gate_reorder_valid = false;
+    cl_mem   moe_q4_gate_src_buffer = nullptr;
+    cl_ulong moe_q4_gate_src_offset = 0;
+    int      moe_q4_gate_ne10 = 0;
+    int      moe_q4_gate_ne11 = 0;
+    int      moe_q4_gate_ne12 = 0;
+    int      moe_q4_gate_ne00 = 0;
+    int      moe_q4_gate_slot_size = 32;
+    uint64_t moe_q4_gate_router_generation = 0;
     cl_program program_add;
     cl_program program_add_id;
     cl_program program_clamp;
@@ -20798,12 +20811,21 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     const int nb21 = src->nb[1];
     const int ne02 = nb21 / src->nb[0];
     const int n_tile_size = GGML_OPENCL_MOE_TILE_N;
-    const bool moe_grouped = moe_expert_slot_size == 8 || moe_expert_slot_size == 16;
-    GGML_ASSERT(moe_expert_slot_size == 32 || moe_grouped);
+    const bool moe_grouped = moe_expert_slot_size == 4 || moe_expert_slot_size == 8 || moe_expert_slot_size == 16;
     const int expert_slot_size = moe_grouped ? moe_expert_slot_size : n_tile_size;
-    // Grouped layouts use a conservative capacity bound based on their slot size.
+    GGML_ASSERT(moe_expert_slot_size == 32 || moe_grouped);
+    const int groups_per_tile = n_tile_size / expert_slot_size;
+    // Previous grouped bound accidentally treated each logical expert group as
+    // a physical 32-token tile, over-allocating by groups_per_tile.
+    //
+    // sum_e ceil(count_e / slot) <= ceil(total_routings / slot) + n_experts.
+    // Convert that logical-group bound back to physical 32-token tiles.
+    const int max_logical_groups =
+        ((ne20 * ne21 + expert_slot_size - 1) / expert_slot_size) + ne02;
+    const int max_grouped_tiles =
+        (max_logical_groups + groups_per_tile - 1) / groups_per_tile;
     const int max_post_router_tile = moe_grouped
-        ? ((ne20 * ne21 + expert_slot_size - 1) / expert_slot_size) + ne02
+        ? max_grouped_tiles
         : (ne20 * ne21 / n_tile_size) + ne02;
     const int emap_per_tile = moe_grouped ? (n_tile_size / expert_slot_size) : 1;
 
@@ -20843,7 +20865,7 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     cl_mem slot_counter_buf = clCreateSubBuffer(backend_ctx->prealloc_slot_counter.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
     CL_CHECK(err);
 
-    const int total_tiles_words = moe_grouped ? 4 : 1;
+    const int total_tiles_words = moe_grouped ? 5 : 1;
     backend_ctx->prealloc_total_tiles.allocate(backend_ctx->context, sizeof(int) * total_tiles_words);
     region.origin = 0;
     region.size = sizeof(int) * total_tiles_words;
@@ -20939,14 +20961,14 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     // routing count. Quantifies the per-expert tile-padding waste. Blocking
     // readback perturbs timing -> diagnostic only.
     if (getenv("GGML_OPENCL_MOE_TILES_DEBUG")) {
-        int h_stats[4] = {0, 0, 0, 0};
+        int h_stats[5] = {0, 0, 0, 0, 0};
         clFinish(backend_ctx->queue);
         CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, total_tiles_buf, CL_TRUE, 0,
             sizeof(int) * total_tiles_words, h_stats, 0, NULL, NULL));        const int routings = ne20 * ne21;
         const int h_total  = h_stats[0];
         const int ideal    = (routings + n_tile_size - 1) / n_tile_size;
         const int slots     = h_total * n_tile_size;
-        const char * layout = expert_slot_size == 8 ? "4x8" : (expert_slot_size == 16 ? "2x16" : "1x32");
+        const char * layout = expert_slot_size == 4 ? "8x4" : (expert_slot_size == 8 ? "4x8" : (expert_slot_size == 16 ? "2x16" : "1x32"));
         fprintf(stderr, "[MOE_TILES] layout=%s routings=%d (ne20=%d ne21=%d nexp=%d) total_tiles=%d ideal=%d slots=%d pad=%.1f%%\n",
         layout, routings, ne20, ne21, ne02, h_total, ideal, slots,
                  routings > 0 ? 100.0 * (slots - routings) / routings : 0.0);
@@ -20955,6 +20977,8 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
 
     backend_ctx->moe_reorder_4x8 = moe_grouped;
     backend_ctx->moe_reorder_slot_size = expert_slot_size;
+    ++backend_ctx->moe_router_generation;
+    backend_ctx->moe_q4_gate_reorder_valid = false;
 
     CL_CHECK(clReleaseMemObject(original_router_buf));
     CL_CHECK(clReleaseMemObject(hist_buf));
@@ -21290,6 +21314,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                 } else { // for gemm
                     kernel = backend_ctx->kernel_gemm_moe_q4_0_f32_ns;
+                    static const bool q4_0_moe_8x4 = []{
+                        const char * e = getenv("GGML_OPENCL_Q4_0_MOE_8X4");
+                        return e && e[0] != '\0' && atoi(e) != 0;
+                    }();
                     static const bool q4_0_moe_4x8 = []{
                         const char * e = getenv("GGML_OPENCL_Q4_0_MOE_4X8");
                         return e && e[0] != '\0' && atoi(e) != 0;
@@ -21298,10 +21326,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         const char * e = getenv("GGML_OPENCL_Q4_0_MOE_2X16");
                         return e && e[0] != '\0' && atoi(e) != 0;
                     }();
-                    GGML_ASSERT(!(q4_0_moe_4x8 && q4_0_moe_2x16));
+                    GGML_ASSERT((int) q4_0_moe_8x4 + (int) q4_0_moe_4x8 + (int) q4_0_moe_2x16 <= 1);
 
-                    const bool q4_0_moe_grouped = q4_0_moe_4x8 || q4_0_moe_2x16;
-                    const int q4_0_expert_slot_size = q4_0_moe_2x16 ? 16 : (q4_0_moe_4x8 ? 8 : 32);
+                    const bool q4_0_moe_grouped = q4_0_moe_8x4 || q4_0_moe_4x8 || q4_0_moe_2x16;
+                    const int q4_0_expert_slot_size = q4_0_moe_8x4 ? 4 : (q4_0_moe_2x16 ? 16 : (q4_0_moe_4x8 ? 8 : 32));
                     const int q4_0_emap_per_tile = q4_0_moe_grouped ? (n_tile_size / q4_0_expert_slot_size) : 1;
 
                     kernel = q4_0_moe_grouped
@@ -21311,21 +21339,31 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         kernel = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin;
                     }
 
+                    // Capacity is expressed in physical 32-token tiles, not
+                    // logical expert groups. Keep this identical to the router
+                    // allocator above.
+                    const int q4_0_groups_per_tile =
+                        n_tile_size / q4_0_expert_slot_size;
+                    const int q4_0_max_logical_groups =
+                        ((ne20 * ne21 + q4_0_expert_slot_size - 1) /
+                         q4_0_expert_slot_size) + ne02;
+                    const int q4_0_max_grouped_tiles =
+                        (q4_0_max_logical_groups + q4_0_groups_per_tile - 1) /
+                        q4_0_groups_per_tile;
                     const int q4_0_max_post_router_tile = q4_0_moe_grouped
-                        ? ((ne20 * ne21 + q4_0_expert_slot_size - 1) / q4_0_expert_slot_size) + ne02
+                        ? q4_0_max_grouped_tiles
                         : (ne20 * ne21 / n_tile_size) + ne02;
 
-                    // Reorder when the router changes or when switching 1x32 / 4x8 / 2x16.
+                    // Reorder when the router changes or when switching 1x32 / 8x4 / 4x8 / 2x16.
                     if ((strstr(src0->name, "as") != NULL) || backend_ctx->toggle_reorder ||
                         backend_ctx->moe_reorder_slot_size != q4_0_expert_slot_size) {
                         moe_router_reoerder(backend, src2, ne20, q4_0_expert_slot_size);
                         backend_ctx->toggle_reorder = false;
                     }
-                    // Diagnostic only: router stats plus the actual 8-column microkernel
-                    // count for this specific Q4_0 matrix. In 2x16, logical_groups
-                    // counts 16-token groups while dot8_groups counts active 8-token halves.
+                    // Diagnostic only: router stats plus actual grouped microkernel counts.
+                    // 8x4 can execute both dotx8 (paired 4-token groups) and dotx4 (odd tails).
                     if (q4_0_moe_grouped && getenv("GGML_OPENCL_MOE_TILES_DEBUG")) {
-                        int h_stats[4] = {0, 0, 0, 0};
+                        int h_stats[5] = {0, 0, 0, 0, 0};
                         clFinish(backend_ctx->queue);
                         CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, backend_ctx->prealloc_total_tiles.buffer,
                                                      CL_TRUE, 0, sizeof(h_stats), h_stats, 0, NULL, NULL));
@@ -21333,26 +21371,30 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         const int logical_groups = h_stats[1];
                         const int expert_runs    = h_stats[2];
                         const int dot8_groups    = h_stats[3];
+                        const int dot4_groups    = h_stats[4];
                         const int k_halves = ne00 / 16;
                         const int m_wgs    = (ne01 + 63) / 64;
 
                         const long long dotx8_per_mwg = (long long)dot8_groups * k_halves;
+                        const long long dotx4_per_mwg = (long long)dot4_groups * k_halves;
                         const long long dotx8_wg_calls = dotx8_per_mwg * m_wgs;
-                        const long long dotx8_workitem_calls = dotx8_wg_calls * 64;
-                        const long long weight_load_per_mwg = (long long)expert_runs * k_halves;
+                        const long long dotx4_wg_calls = dotx4_per_mwg * m_wgs;
+                        const long long dot_micro_wg_calls = dotx8_wg_calls + dotx4_wg_calls;
+                        const long long weight_load_units = q4_0_moe_8x4 ? (long long)(dot8_groups + dot4_groups) : (long long)expert_runs;
+                        const long long weight_load_per_mwg = weight_load_units * k_halves;
                         const long long weight_load_wg_calls = weight_load_per_mwg * m_wgs;
-                        const char * layout = q4_0_moe_2x16 ? "2x16" : "4x8";
+                        const char * layout = q4_0_moe_8x4 ? "8x4" : (q4_0_moe_2x16 ? "2x16" : "4x8");
 
                         fprintf(stderr,
-                        "[MOE_GROUPED_STATS] layout=%s weight=%s groups=%d dot8_groups=%d "
-                        "expert_runs=%d groups_per_run=%.3f ne00=%d ne01=%d k_halves=%d m_wgs=%d "
-                        "dotx8_per_mwg=%lld dotx8_wg_calls=%lld dotx8_workitem_calls=%lld "
-                                "weight_load_per_mwg=%lld weight_load_wg_calls=%lld\n",
-                                layout, src0->name, logical_groups, dot8_groups, expert_runs,
-                                expert_runs > 0 ? (double)logical_groups / expert_runs : 0.0,
-                                ne00, ne01, k_halves, m_wgs,
-                                dotx8_per_mwg, dotx8_wg_calls, dotx8_workitem_calls,
-                                weight_load_per_mwg, weight_load_wg_calls);
+                            "[MOE_GROUPED_STATS] layout=%s weight=%s groups=%d dot8_groups=%d dot4_groups=%d "
+                            "expert_runs=%d groups_per_run=%.3f ne00=%d ne01=%d k_halves=%d m_wgs=%d "
+                            "dotx8_per_mwg=%lld dotx4_per_mwg=%lld dotx8_wg_calls=%lld dotx4_wg_calls=%lld "
+                            "dot_micro_wg_calls=%lld weight_load_per_mwg=%lld weight_load_wg_calls=%lld\n",
+                            layout, src0->name, logical_groups, dot8_groups, dot4_groups, expert_runs,
+                            expert_runs > 0 ? (double)logical_groups / expert_runs : 0.0,
+                            ne00, ne01, k_halves, m_wgs,
+                            dotx8_per_mwg, dotx4_per_mwg, dotx8_wg_calls, dotx4_wg_calls,
+                            dot_micro_wg_calls, weight_load_per_mwg, weight_load_wg_calls);
                         fflush(stderr);
                     }
 
@@ -21389,6 +21431,21 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     unsigned short map_ratio = ne20 / ne11;
                     GGML_ASSERT(((map_ratio == 1) || (map_ratio == ne20)) && "Map ratio not supported\n");
 
+                    const bool is_gate_exps = strstr(src0->name, "gate_exps") != nullptr;
+                    const bool is_up_exps   = strstr(src0->name, "up_exps") != nullptr;
+                    const bool grouped_reorder_cache_hit =
+                        q4_0_moe_grouped &&
+                        is_up_exps &&
+                        backend_ctx->moe_q4_gate_reorder_valid &&
+                        backend_ctx->moe_q4_gate_src_buffer == extra1->data_device &&
+                        backend_ctx->moe_q4_gate_src_offset == offset1 &&
+                        backend_ctx->moe_q4_gate_ne10 == ne10 &&
+                        backend_ctx->moe_q4_gate_ne11 == ne11 &&
+                        backend_ctx->moe_q4_gate_ne12 == ne12 &&
+                        backend_ctx->moe_q4_gate_ne00 == ne00 &&
+                        backend_ctx->moe_q4_gate_slot_size == q4_0_expert_slot_size &&
+                        backend_ctx->moe_q4_gate_router_generation == backend_ctx->moe_router_generation;
+
                     if (!use_moe_dp4a) {
                         // Create image for reordered src1
                         // Use pre-allocated placeholder
@@ -21414,19 +21471,59 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         image_src1_reordered = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY, &image_format_buf_src1, &image_desc_buf_src1, NULL, &status);
                         CL_CHECK(status);
 
-                        CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 0, sizeof(cl_mem),        &sub_buf_src1_pre));
-                        CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 1, sizeof(cl_mem),        &buf_src2));
-                        CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 2, sizeof(cl_mem),        &buf_src1_reordered));
-                        CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 3, sizeof(cl_mem),        &(backend_ctx->prealloc_total_tiles.buffer)));
-                        CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 4, sizeof(unsigned int),  &ne00));
-                        CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 5, sizeof(unsigned short),  &map_ratio));
-                        CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 6, sizeof(unsigned int),  &n_tile_size));
 
-                        size_t reorder_b_local_size[3] = {256, 1, 1};
-                        size_t reorder_b_global_size[3] = {static_cast<size_t>(((ne00 / 4) + 255) / 256 * 256), static_cast<size_t>(q4_0_max_post_router_tile * n_tile_size), 1};
+                        if (!grouped_reorder_cache_hit) {
+                            CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 0, sizeof(cl_mem), &sub_buf_src1_pre));
+                            CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 1, sizeof(cl_mem), &buf_src2));
+                            CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 2, sizeof(cl_mem), &buf_src1_reordered));
+                            CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 3, sizeof(cl_mem), &(backend_ctx->prealloc_total_tiles.buffer)));
+                            CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 4, sizeof(unsigned int), &ne00));
+                            CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 5, sizeof(unsigned short), &map_ratio));
+                            CL_CHECK(clSetKernelArg(backend_ctx->kernel_moe_reorder_b, 6, sizeof(unsigned int), &n_tile_size));
+                            size_t reorder_b_local_size[3] = {256, 1, 1};
+                            size_t reorder_b_global_size[3] = {
+                                static_cast<size_t>(((ne00 / 4) + 255) / 256 * 256),
+                                static_cast<size_t>(q4_0_max_post_router_tile * n_tile_size),
+                                1
+                            };
+                            // Dispatch reorder kernel
+                            backend_ctx->enqueue_ndrange_kernel(
+                                backend_ctx->kernel_moe_reorder_b, 3,
+                                reorder_b_global_size, reorder_b_local_size, dst);
 
-                        // Dispatch reorder kernel
-                        backend_ctx->enqueue_ndrange_kernel(backend_ctx->kernel_moe_reorder_b, 3, reorder_b_global_size, reorder_b_local_size, dst);
+                            if (q4_0_moe_grouped && is_gate_exps) {
+                                backend_ctx->moe_q4_gate_reorder_valid = true;
+                                backend_ctx->moe_q4_gate_src_buffer = extra1->data_device;
+                                backend_ctx->moe_q4_gate_src_offset = offset1;
+                                backend_ctx->moe_q4_gate_ne10 = ne10;
+                                backend_ctx->moe_q4_gate_ne11 = ne11;
+                                backend_ctx->moe_q4_gate_ne12 = ne12;
+                                backend_ctx->moe_q4_gate_ne00 = ne00;
+                                backend_ctx->moe_q4_gate_slot_size = q4_0_expert_slot_size;
+                                backend_ctx->moe_q4_gate_router_generation = backend_ctx->moe_router_generation;
+                            } else if (q4_0_moe_grouped) {
+                                backend_ctx->moe_q4_gate_reorder_valid = false;
+                            }
+                        } else {
+                            // Consume the gate reorder exactly once.
+                            backend_ctx->moe_q4_gate_reorder_valid = false;
+                        }
+                        if (q4_0_moe_grouped && getenv("GGML_OPENCL_MOE_SYNC_DEBUG") && !grouped_reorder_cache_hit) {
+                            const char * sync_layout = q4_0_moe_8x4 ? "8x4" : (q4_0_moe_2x16 ? "2x16" : "4x8");
+                            fprintf(stderr, "[MOE_SYNC] begin stage=reorder_b layout=%s weight=%s\n", sync_layout, src0->name);
+                            fflush(stderr);
+                            const cl_int sync_status = clFinish(backend_ctx->queue);
+                            fprintf(stderr, "[MOE_SYNC] done stage=reorder_b layout=%s weight=%s err=%d\n",
+                                sync_layout, src0->name, (int) sync_status);
+                            fflush(stderr);
+                            CL_CHECK(sync_status);
+                        } else if (q4_0_moe_grouped && getenv("GGML_OPENCL_MOE_SYNC_DEBUG") && grouped_reorder_cache_hit) {
+                            const char * sync_layout = q4_0_moe_8x4 ? "8x4" : (q4_0_moe_2x16 ? "2x16" : "4x8");
+                            fprintf(stderr,
+                                "[MOE_SYNC] skip stage=reorder_b reason=gate_cache_hit layout=%s weight=%s\n",
+                                sync_layout, src0->name);
+                            fflush(stderr);
+                        }
                     }
 
                     // MoE kernel prepare
@@ -21523,18 +21620,25 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Dispatch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
-                    // Probe matches the source FP16 kernel only.
-                    // DP4A has returned above; skip when the binary kernel is active.
-                    if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr) {
-                        ggml_cl_profile_q4_0_moe_weight_load(
-                            backend_ctx,
-                            extra0_q4_0->q_img,
-                            extra0_q4_0->d,
-                            buf_src2,
-                            buf_src2_emap,
-                            ne00,
-                            ne01,
-                            dst);
+                    if (q4_0_moe_grouped && getenv("GGML_OPENCL_MOE_SYNC_DEBUG")) {
+                        const char * sync_layout = q4_0_moe_8x4 ? "8x4" : (q4_0_moe_2x16 ? "2x16" : "4x8");
+                        fprintf(stderr, "[MOE_SYNC] begin stage=gemm layout=%s weight=%s\n", sync_layout, src0->name);
+                        fflush(stderr);
+                        const cl_int sync_status = clFinish(backend_ctx->queue);
+                        fprintf(stderr, "[MOE_SYNC] done stage=gemm layout=%s weight=%s err=%d\n",
+                            sync_layout, src0->name, (int) sync_status);
+                        fflush(stderr);
+                        CL_CHECK(sync_status);
+                    }
+                    if (q4_0_moe_8x4 && is_gate_exps && getenv("GGML_OPENCL_MOE_REPEAT_GATE_DEBUG")) {
+                        fprintf(stderr, "[MOE_REPEAT] begin weight=%s\n", src0->name);
+                        fflush(stderr);
+                        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                        const cl_int repeat_status = clFinish(backend_ctx->queue);
+                        fprintf(stderr, "[MOE_REPEAT] done weight=%s err=%d\n",
+                                src0->name, (int) repeat_status);
+                        fflush(stderr);
+                        CL_CHECK(repeat_status);
                     }
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);

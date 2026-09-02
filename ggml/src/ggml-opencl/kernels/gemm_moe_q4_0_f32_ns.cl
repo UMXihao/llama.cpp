@@ -388,16 +388,56 @@ kernel void kernel_moe_q4_0_weight_load_probe(
     sink[block_id_m * TILESIZE_M + get_local_id(0)] = checksum;
 }
 
-// Experimental grouped Q4_0 MoE GEMM for 4x8 and 2x16 router layouts.
-// The work-group geometry remains 64 threads / TILESIZE_N=32. Computation still
-// uses four 8-column dotx8 microkernels; expert_slot_size only changes how those
-// four micro-groups map to emap entries.
+// Experimental grouped Q4_0 MoE GEMM for 8x4, 4x8 and 2x16 router layouts.
+// The work-group geometry remains 64 threads / TILESIZE_N=32. The 8x4 path
+// fuses adjacent 4-token groups from the same expert into an unaligned dotx8
+// when possible and falls back to dotx4 for odd run tails.
 #define Q4_0_LOAD_EXPERT_4X8(EXPERT_ID, Q_STEP, SCALE) do { \
     const uint _q_sub_offset = row + ((ne01 * (Q_STEP)) >> 3) + (((uint)(EXPERT_ID) * ne00 * ne01) >> 3); \
     uint2 _q4x16; \
     _q4x16.x = read_imageui(src0_q, _q_sub_offset + sub_block_id_m).x; \
     _q4x16.y = read_imageui(src0_q, _q_sub_offset + sub_block_id_m + ne01).x; \
     dequantize_q4_0(as_ushort4(_q4x16), reg_a, (SCALE)); \
+} while (0)
+
+#define Q4_0_DOTX4_SAFE_LO(A_REG, B_LM, C_REG, LM_OFFSET) do { \
+    float4 _keep_hi = (C_REG).hi; \
+    dotx8_reduce4((A_REG), (B_LM), (C_REG), (LM_OFFSET)); \
+    (C_REG).hi = _keep_hi; \
+} while (0)
+
+#define Q4_0_DOTX4_SAFE_HI(A_REG, B_LM, C_REG, LM_OFFSET) do { \
+    float4 _keep_lo = (C_REG).lo; \
+    dotx8_reduce4((A_REG), (B_LM), (C_REG), (LM_OFFSET)); \
+    (C_REG).lo = _keep_lo; \
+} while (0)
+
+// Fully static Adreno 8x4 pair. There are no dynamically-indexed private
+// arrays, loops or switches in the slot=4 compute path.
+#define Q4_0_PROCESS_8X4_PAIR(Q_STEP, ACTIVE_LO, EXPERT_LO, ACTIVE_HI, EXPERT_HI, C_REG, LM_OFFSET) do { \
+    if ((ACTIVE_LO) && (ACTIVE_HI) && (EXPERT_LO) == (EXPERT_HI)) { \
+        const half _scale_pair = src0_d[scale_step_offset + (((uint)(EXPERT_LO) * ne00 * ne01) >> 5)]; \
+        Q4_0_LOAD_EXPERT_4X8((EXPERT_LO), (Q_STEP), _scale_pair); \
+        dotx8_reduce4(reg_a, shared_b, (C_REG), (LM_OFFSET)); \
+    } else { \
+        if (ACTIVE_LO) { \
+            const half _scale_lo = src0_d[scale_step_offset + (((uint)(EXPERT_LO) * ne00 * ne01) >> 5)]; \
+            Q4_0_LOAD_EXPERT_4X8((EXPERT_LO), (Q_STEP), _scale_lo); \
+            Q4_0_DOTX4_SAFE_LO(reg_a, shared_b, (C_REG), (LM_OFFSET)); \
+        } \
+        if (ACTIVE_HI) { \
+            const half _scale_hi = src0_d[scale_step_offset + (((uint)(EXPERT_HI) * ne00 * ne01) >> 5)]; \
+            Q4_0_LOAD_EXPERT_4X8((EXPERT_HI), (Q_STEP), _scale_hi); \
+            Q4_0_DOTX4_SAFE_HI(reg_a, shared_b, (C_REG), (LM_OFFSET)); \
+        } \
+    } \
+} while (0)
+
+#define Q4_0_PROCESS_8X4_HALF(Q_STEP) do { \
+    Q4_0_PROCESS_8X4_PAIR((Q_STEP), active4_0, expert4_0, active4_1, expert4_1, reg_c.lo.lo,  0); \
+    Q4_0_PROCESS_8X4_PAIR((Q_STEP), active4_2, expert4_2, active4_3, expert4_3, reg_c.lo.hi,  8); \
+    Q4_0_PROCESS_8X4_PAIR((Q_STEP), active4_4, expert4_4, active4_5, expert4_5, reg_c.hi.lo, 16); \
+    Q4_0_PROCESS_8X4_PAIR((Q_STEP), active4_6, expert4_6, active4_7, expert4_7, reg_c.hi.hi, 24); \
 } while (0)
 
 __attribute__((qcom_wave_pair_mode(1)))
@@ -421,11 +461,11 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
         return;
     }
 
-    // expert_slot_size is 8 for 4x8 or 16 for 2x16. is_ragged/skip_gran are
-    // retained for argument compatibility with the legacy source kernel.
+    // expert_slot_size is 4 for 8x4, 8 for 4x8 or 16 for 2x16.
+    // is_ragged/skip_gran are retained for compatibility with the legacy source kernel.
     (void)is_ragged;
     (void)skip_gran;
-    if (expert_slot_size != 8 && expert_slot_size != 16) {
+    if (expert_slot_size != 4 && expert_slot_size != 8 && expert_slot_size != 16) {
         return;
     }
 
@@ -435,18 +475,36 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
     const bool active_g2 = src2[router_base + 16] != 0xFFFFFFFFu;
     const bool active_g3 = src2[router_base + 24] != 0xFFFFFFFFu;
 
-    // Empty micro-groups have no valid emap entry. For 2x16, micro-groups
-    // (0,1) share emap[0] and (2,3) share emap[1]. For 4x8 each has its own.
-    const uint emap_per_tile = expert_slot_size == 16 ? 2 : 4;
+    // Empty groups have no valid emap entry. The 8/16-token paths map the
+    // four aligned dotx8 groups to expert slots. The 4-token path below uses all
+    // eight emap entries and may pair adjacent entries into one unaligned dotx8.
+    const uint emap_per_tile = TILESIZE_N / expert_slot_size;
     const uint emap_base = block_id_n * emap_per_tile;
     const uint eidx0 = 0;
-    const uint eidx1 = expert_slot_size == 16 ? 0 : 1;
-    const uint eidx2 = expert_slot_size == 16 ? 1 : 2;
-    const uint eidx3 = expert_slot_size == 16 ? 1 : 3;
+    const uint eidx1 = 8 / expert_slot_size;
+    const uint eidx2 = 16 / expert_slot_size;
+    const uint eidx3 = 24 / expert_slot_size;
     const ushort expert0 = active_g0 ? src2_emap[emap_base + eidx0] : (ushort)0;
     const ushort expert1 = active_g1 ? src2_emap[emap_base + eidx1] : (ushort)0;
     const ushort expert2 = active_g2 ? src2_emap[emap_base + eidx2] : (ushort)0;
     const ushort expert3 = active_g3 ? src2_emap[emap_base + eidx3] : (ushort)0;
+
+    const bool active4_0 = expert_slot_size == 4 && src2[router_base +  0] != 0xFFFFFFFFu;
+    const bool active4_1 = expert_slot_size == 4 && src2[router_base +  4] != 0xFFFFFFFFu;
+    const bool active4_2 = expert_slot_size == 4 && src2[router_base +  8] != 0xFFFFFFFFu;
+    const bool active4_3 = expert_slot_size == 4 && src2[router_base + 12] != 0xFFFFFFFFu;
+    const bool active4_4 = expert_slot_size == 4 && src2[router_base + 16] != 0xFFFFFFFFu;
+    const bool active4_5 = expert_slot_size == 4 && src2[router_base + 20] != 0xFFFFFFFFu;
+    const bool active4_6 = expert_slot_size == 4 && src2[router_base + 24] != 0xFFFFFFFFu;
+    const bool active4_7 = expert_slot_size == 4 && src2[router_base + 28] != 0xFFFFFFFFu;
+    const ushort expert4_0 = active4_0 ? src2_emap[emap_base + 0] : (ushort)0;
+    const ushort expert4_1 = active4_1 ? src2_emap[emap_base + 1] : (ushort)0;
+    const ushort expert4_2 = active4_2 ? src2_emap[emap_base + 2] : (ushort)0;
+    const ushort expert4_3 = active4_3 ? src2_emap[emap_base + 3] : (ushort)0;
+    const ushort expert4_4 = active4_4 ? src2_emap[emap_base + 4] : (ushort)0;
+    const ushort expert4_5 = active4_5 ? src2_emap[emap_base + 5] : (ushort)0;
+    const ushort expert4_6 = active4_6 ? src2_emap[emap_base + 6] : (ushort)0;
+    const ushort expert4_7 = active4_7 ? src2_emap[emap_base + 7] : (ushort)0;
 
     __private half16 reg_a;
     __private float32 reg_c = (float32)(0);
@@ -468,24 +526,30 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
         // A Q4_0 scale covers a full 32-element block, so the same scale is
         // reused for the first and second 16-K halves of this iteration.
         const uint scale_step_offset = row + ((ne01 * step) >> 5) + get_global_id(0);
-        const half s0 = active_g0
-            ? src0_d[scale_step_offset + (((uint)expert0 * ne00 * ne01) >> 5)]
-            : (half)0;
-        const half s1 = active_g1
-            ? ((active_g0 && expert1 == expert0)
-                ? s0
-                : src0_d[scale_step_offset + (((uint)expert1 * ne00 * ne01) >> 5)])
-            : (half)0;
-        const half s2 = active_g2
-            ? ((active_g1 && expert2 == expert1)
-                ? s1
-                : src0_d[scale_step_offset + (((uint)expert2 * ne00 * ne01) >> 5)])
-            : (half)0;
-        const half s3 = active_g3
-            ? ((active_g2 && expert3 == expert2)
-                ? s2
-                : src0_d[scale_step_offset + (((uint)expert3 * ne00 * ne01) >> 5)])
-            : (half)0;
+        half s0 = (half)0;
+        half s1 = (half)0;
+        half s2 = (half)0;
+        half s3 = (half)0;
+        if (expert_slot_size != 4) {
+            s0 = active_g0
+                ? src0_d[scale_step_offset + (((uint)expert0 * ne00 * ne01) >> 5)]
+                : (half)0;
+            s1 = active_g1
+                ? ((active_g0 && expert1 == expert0)
+                    ? s0
+                    : src0_d[scale_step_offset + (((uint)expert1 * ne00 * ne01) >> 5)])
+                : (half)0;
+            s2 = active_g2
+                ? ((active_g1 && expert2 == expert1)
+                    ? s1
+                    : src0_d[scale_step_offset + (((uint)expert2 * ne00 * ne01) >> 5)])
+                : (half)0;
+            s3 = active_g3
+                ? ((active_g2 && expert3 == expert2)
+                    ? s2
+                    : src0_d[scale_step_offset + (((uint)expert3 * ne00 * ne01) >> 5)])
+                : (half)0;
+        }
 
         // First 16-K half: load the whole 32-column B tile once.
         uint b_sub_offset = col * ne00 + step;
@@ -498,41 +562,47 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
         half8 acc8;
-        // Router packing keeps repeated experts contiguous. Load/dequantize A
-        // once per expert run, then reuse reg_a for every 8-column group in it.
-        if (active_g0) {
-            Q4_0_LOAD_EXPERT_4X8(expert0, step, s0);
-            dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
-            if (active_g1 && expert1 == expert0) {
-                dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8);
+
+        half4 acc4;
+        if (expert_slot_size == 4) {
+            Q4_0_PROCESS_8X4_HALF(step);
+        } else {
+            // Router packing keeps repeated experts contiguous. Load/dequantize A
+            // once per expert run, then reuse reg_a for every 8-column group in it.
+            if (active_g0) {
+                Q4_0_LOAD_EXPERT_4X8(expert0, step, s0);
+                dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
+                if (active_g1 && expert1 == expert0) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8);
+                }
+                if (active_g2 && expert1 == expert0 && expert2 == expert0) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
+                }
+                if (active_g3 && expert1 == expert0 && expert2 == expert0 && expert3 == expert0) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
+                }
             }
-            if (active_g2 && expert1 == expert0 && expert2 == expert0) {
+            if (active_g1 && (!active_g0 || expert1 != expert0)) {
+                Q4_0_LOAD_EXPERT_4X8(expert1, step, s1);
+                 dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8);
+                if (active_g2 && expert2 == expert1) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
+                }
+                if (active_g3 && expert2 == expert1 && expert3 == expert1) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
+                }
+            }
+            if (active_g2 && (!active_g1 || expert2 != expert1)) {
+                Q4_0_LOAD_EXPERT_4X8(expert2, step, s2);
                 dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
+                if (active_g3 && expert3 == expert2) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
+                }
             }
-            if (active_g3 && expert1 == expert0 && expert2 == expert0 && expert3 == expert0) {
+            if (active_g3 && (!active_g2 || expert3 != expert2)) {
+                Q4_0_LOAD_EXPERT_4X8(expert3, step, s3);
                 dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
             }
-        }
-        if (active_g1 && (!active_g0 || expert1 != expert0)) {
-            Q4_0_LOAD_EXPERT_4X8(expert1, step, s1);
-            dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8);
-            if (active_g2 && expert2 == expert1) {
-                dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
-            }
-            if (active_g3 && expert2 == expert1 && expert3 == expert1) {
-                dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
-            }
-        }
-        if (active_g2 && (!active_g1 || expert2 != expert1)) {
-            Q4_0_LOAD_EXPERT_4X8(expert2, step, s2);
-            dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
-            if (active_g3 && expert3 == expert2) {
-                dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
-            }
-        }
-        if (active_g3 && (!active_g2 || expert3 != expert2)) {
-            Q4_0_LOAD_EXPERT_4X8(expert3, step, s3);
-            dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
         }
 
         // Second 16-K half.
@@ -545,39 +615,43 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
         shared_b[b_local_offset.y] = bx8_f16.hi;
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
-        if (active_g0) {
-            Q4_0_LOAD_EXPERT_4X8(expert0, half_step, s0);
-            dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
-            if (active_g1 && expert1 == expert0) {
+        if (expert_slot_size == 4) {
+            Q4_0_PROCESS_8X4_HALF(half_step);
+        } else {
+            if (active_g0) {
+                Q4_0_LOAD_EXPERT_4X8(expert0, half_step, s0);
+                dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
+                if (active_g1 && expert1 == expert0) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8);
+                }
+                if (active_g2 && expert1 == expert0 && expert2 == expert0) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
+                }
+                if (active_g3 && expert1 == expert0 && expert2 == expert0 && expert3 == expert0) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
+                }
+            }
+            if (active_g1 && (!active_g0 || expert1 != expert0)) {
+                Q4_0_LOAD_EXPERT_4X8(expert1, half_step, s1);
                 dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8);
+                if (active_g2 && expert2 == expert1) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
+                }
+                if (active_g3 && expert2 == expert1 && expert3 == expert1) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
+                }
             }
-            if (active_g2 && expert1 == expert0 && expert2 == expert0) {
+            if (active_g2 && (!active_g1 || expert2 != expert1)) {
+                Q4_0_LOAD_EXPERT_4X8(expert2, half_step, s2);
                 dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
+                if (active_g3 && expert3 == expert2) {
+                    dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
+                }
             }
-            if (active_g3 && expert1 == expert0 && expert2 == expert0 && expert3 == expert0) {
+            if (active_g3 && (!active_g2 || expert3 != expert2)) {
+                Q4_0_LOAD_EXPERT_4X8(expert3, half_step, s3);
                 dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
             }
-        }
-        if (active_g1 && (!active_g0 || expert1 != expert0)) {
-            Q4_0_LOAD_EXPERT_4X8(expert1, half_step, s1);
-            dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8);
-            if (active_g2 && expert2 == expert1) {
-                dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
-            }
-            if (active_g3 && expert2 == expert1 && expert3 == expert1) {
-                dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
-            }
-        }
-        if (active_g2 && (!active_g1 || expert2 != expert1)) {
-            Q4_0_LOAD_EXPERT_4X8(expert2, half_step, s2);
-            dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16);
-            if (active_g3 && expert3 == expert2) {
-                dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
-            }
-        }
-        if (active_g3 && (!active_g2 || expert3 != expert2)) {
-            Q4_0_LOAD_EXPERT_4X8(expert3, half_step, s3);
-            dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24);
         }
     }
     
@@ -696,4 +770,8 @@ kernel void kernel_gemm_moe_q4_0_f32_ns_4x8(
     }
 }
 
+#undef Q4_0_PROCESS_8X4_HALF
+#undef Q4_0_PROCESS_8X4_PAIR
+#undef Q4_0_DOTX4_SAFE_HI
+#undef Q4_0_DOTX4_SAFE_LO
 #undef Q4_0_LOAD_EXPERT_4X8
