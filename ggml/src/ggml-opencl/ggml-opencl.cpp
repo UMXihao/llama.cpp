@@ -20552,7 +20552,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
     int nrows = 1;  // number of row in src1
     int ndst  = 4;  // number of values produced by each subgroup
 
-    const int n_tile_size = src0->type == GGML_TYPE_Q4_K ? 8 : 32;
+    const int n_tile_size = 8;
     const int max_post_router_tile = (ne20 * ne21 / n_tile_size) + ne02;
 
     GGML_UNUSED(max_post_router_tile);
