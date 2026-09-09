@@ -6,6 +6,10 @@ export OPENCL_SDK_ROOT=/home/lili-5090/Sean/Hexagon_SDK/6.4.0.2/tools/android-nd
 export HEXAGON_SDK_ROOT=/home/lili-5090/Sean/Hexagon_SDK/6.4.0.2/
 export HEXAGON_TOOLS_ROOT=/home/lili-5090/Sean/Hexagon_SDK/6.4.0.2/tools/HEXAGON_Tools/19.0.04/
 
+rm -rf npu-parallel
+mkdir npu-parallel
+rm -rf build-snapdragon
+
 cmake \
 -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
 -DANDROID_ABI=arm64-v8a \
@@ -57,9 +61,9 @@ server-http.h add header file.
 
 ```shell
 mkdir snapdragon
-cmake --install build-snapdragon --prefix hmx-hvx/ --config Release
+cmake --install build-snapdragon --prefix npu-parallel/ --config Release
 
-adb push hmx-hvx/ /data/local/tmp/
+adb push npu-parallel/ /data/local/tmp/
 ```
 
 # How to Run
@@ -150,9 +154,8 @@ GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 LD_LIBRARY_PATH
 --ctx-size 8192 --batch-size 128 -fa on -v \
 -ngl 99 --device GPUOpenCL -f ../models/fix-token.txt --no-display-prompt
 
-GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
---ctx-size 8192 --batch-size 128 -fa on -v \
--ngl 99 --device HTP0,GPUOpenCL -f ../models/fix-token.txt --no-display-prompt
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-server -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
+ -fa on -ngl 99 --device HTP0 -f ../models/fix-token.txt --no-display-prompt
 
 GGML_HEXAGON_VERBOSE=1 GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2 LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-cli --no-mmap -m ../models/deepseek-v2-lite-chat-q4_0.gguf \
 --ctx-size 8192 --batch-size 128 -fa on -v \
@@ -237,7 +240,7 @@ cmake \
 -DANDROID_PLATFORM=android-28 \
 -DBUILD_SHARED_LIBS=OFF \
 -DLLAMA_CURL=OFF \
--DGGML_OPENCL=ON \
+-DGGML_OPENCL=ON \f
 -DGGML_OPENMP=OFF \
 -B build-android
 
@@ -320,7 +323,7 @@ adb push frame_test.pbtxt /data/misc/perfetto-configs/
 
 adb shell pm list packages | grep example
 
-adb shell monkey -p com.example.game 1
+adb shell monkey -p package:com.heytap.browser 1
 
 adb shell perfetto \
 --txt \

@@ -110,6 +110,20 @@ struct htp_mm_context {
     uint32_t mmid_hmx_min_rows;
     uint32_t mmid_hmx_min_util_pct;
 
+    // Parallel MoE prefill support. NULL/0 keeps the original behavior.
+    uint8_t * vtcm_base_override;
+    size_t    vtcm_size_override;
+    bool      mmid_parallel;
+    uint8_t * hmx_vtcm_base;
+    size_t    hmx_vtcm_size;
+    int     (*hmx_overlap_fn)(void * opaque);
+    void    * hmx_overlap_opaque;
+    bool      hmx_overlap_done;
+    // skips mask==1 and HVX executes only mask==1.
+    // v2: explicit opportunistic-HVX expert mask. In parallel mode HMX
+
+    const uint8_t * mmid_hvx_expert_mask;
+
     // Dynamic VTCM pointers allocated sequentially
     uint8_t * vtcm_src0;
     uint8_t * vtcm_src1;
@@ -1209,8 +1223,16 @@ static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
             continue;
         }
 
-        // The HMX pass already produced hot experts in hybrid mode.
-        if (mmctx->mmid_hybrid && mmid_is_hmx_worthy(mmctx, (uint32_t) cne1)) {
+        if (mmctx->mmid_parallel) {
+            // v2 parallel path: only execute the tiny explicitly selected
+            // helper set. Do not apply the old rows/tile heuristic here.
+            if (mmctx->mmid_hvx_expert_mask == NULL ||
+                mmctx->mmid_hvx_expert_mask[cur_a] == 0) {
+                continue;
+            }
+        } else if (mmctx->mmid_hybrid &&
+                   mmid_is_hmx_worthy(mmctx, (uint32_t) cne1)) {
+            // Existing serial-hybrid behavior.
             continue;
         }
 
@@ -2853,20 +2875,25 @@ static void transfer_output_chunk_scattered_threaded(
     }
 }
 
-static int hmx_mm_id_2d_f32(struct htp_context *ctx,
-                                         float *restrict dst,
-                                         const float *activation,
-                                         const uint8_t *weight,
-                                         int m, int k, int n,
-                                         int k_valid,
-                                         int ne11,
-                                         size_t act_nb1, size_t act_nb2,
-                                         size_t dst_nb1, size_t dst_nb2,
-                                         int weight_stride,
-                                         int weight_type,
-                                         const struct mmid_row_mapping *matrix_rows,
-                                         int cur_a,
-                                         int mapping_stride) {
+static int hmx_mm_id_2d_f32_ex(struct htp_context *ctx,
+                               float *restrict dst,
+                               const float *activation,
+                               const uint8_t *weight,
+                               int m, int k, int n,
+                               int k_valid,
+                               int ne11,
+                               size_t act_nb1, size_t act_nb2,
+                               size_t dst_nb1, size_t dst_nb2,
+                               int weight_stride,
+                               int weight_type,
+                               const struct mmid_row_mapping *matrix_rows,
+                               int cur_a,
+                               int mapping_stride,
+                               uint8_t * hmx_vtcm_base,
+                               size_t hmx_vtcm_budget,
+                               int (*overlap_fn)(void * opaque),
+                               void * overlap_opaque,
+                               bool * overlap_done) {
     const int cne1 = m;
     const int m_padded = hex_align_up(m, 32);
 
@@ -2898,7 +2925,8 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
     const bool is_quant   = (weight_type != HTP_TYPE_F16 && weight_type != HTP_TYPE_F32);
 
     const size_t vec_dot_size = k * sizeof(__fp16);
-    const size_t vtcm_budget  = ctx->vtcm_size;
+    uint8_t * const hmx_base = hmx_vtcm_base ? hmx_vtcm_base : (uint8_t *) ctx->vtcm_base;
+    const size_t vtcm_budget = hmx_vtcm_budget ? hmx_vtcm_budget : ctx->vtcm_size;
     size_t vtcm_used = 0;
 
     int tile_size = htp_mm_get_weight_tile_size(weight_type);
@@ -2930,14 +2958,14 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
 
     size_t scratch0_size = hex_align_up(n_chunk_n_cols * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
 
-    uint8_t *vtcm_ptr      = (uint8_t *) ctx->vtcm_base;
+    uint8_t *vtcm_ptr      = hmx_base;
     __fp16  *vtcm_weight   = weight_area_size ? (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, weight_area_size) : NULL;
     __fp16  *vtcm_f16_act  = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, act_area_size);
     __fp16  *vtcm_output   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
     void    *vtcm_scratch0 = vtcm_seq_alloc(&vtcm_ptr, scratch0_size);
     __fp16  *vtcm_scales   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
 
-    vtcm_used = vtcm_ptr - (uint8_t *) ctx->vtcm_base;
+    vtcm_used = (size_t) (vtcm_ptr - hmx_base);
     if (vtcm_used > vtcm_budget) {
         FARF(ERROR, "hmx-mm-id-2d: VTCM overflow: used %zu budget %zu", vtcm_used, vtcm_budget);
         return -1;
@@ -2977,19 +3005,38 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                 n_k_tiles, n_k_tiles_div, dequant_worker_fn, n_threads
             );
 
-            // Start weight DMA for the next chunk early
+            // During the one HMX/HVX overlap window, defer the next HMX weight
+            // DMA because HVX worker 0 also owns ctx->dma[0].
+            const bool run_overlap = overlap_fn && overlap_done && !*overlap_done;
             const size_t nc_next = nc + n_chunk_n_cols;
+            bool defer_next_weight_dma = false;
             if (nc_next < (size_t) n) {
+                if (run_overlap) {
+                    defer_next_weight_dma = true;
+                } else {
+                    const size_t n_cols_next = hex_smin((size_t) n - nc_next, n_chunk_n_cols);
+                    const uint32_t height_next = is_quant ? (n_cols_next / 32) * n_k_tiles : n_cols_next;
+                    dma_queue_push(ctx->dma[0], dma_make_ptr(curr_raw, weight + nc_next * weight_stride),
+                                       dma_dst_stride, dma_src_stride, dma_width_bytes, height_next);
+                }
+            }
+            // C: HMX Compute (Queue-based)
+            hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, vtcm_scratch0, vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
+            if (!hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job))) {
+                return -1;
+            }
+            if (run_overlap) {
+                FARF(ERROR, "[MOE-PAR] HMX active -> HVX overlap start");
+                (void) overlap_fn(overlap_opaque);
+                *overlap_done = true;
+            }
+            hmx_queue_pop(ctx->hmx_queue);
+            if (defer_next_weight_dma) {
                 const size_t n_cols_next = hex_smin((size_t) n - nc_next, n_chunk_n_cols);
                 const uint32_t height_next = is_quant ? (n_cols_next / 32) * n_k_tiles : n_cols_next;
                 dma_queue_push(ctx->dma[0], dma_make_ptr(curr_raw, weight + nc_next * weight_stride),
                                dma_dst_stride, dma_src_stride, dma_width_bytes, height_next);
             }
-
-            // C: HMX Compute (Queue-based)
-            hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, vtcm_scratch0, vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
-            hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
-            hmx_queue_pop(ctx->hmx_queue);
 
             // D: Output Store
             transfer_output_chunk_scattered_threaded(
@@ -2999,6 +3046,29 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
     }
 
     return 0;
+}
+
+// Preserve the original private ABI for non-parallel callers.
+static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+                            float *restrict dst,
+                            const float *activation,
+                            const uint8_t *weight,
+                            int m, int k, int n,
+                            int k_valid,
+                            int ne11,
+                            size_t act_nb1, size_t act_nb2,
+                            size_t dst_nb1, size_t dst_nb2,
+                            int weight_stride,
+                            int weight_type,
+                            const struct mmid_row_mapping *matrix_rows,
+                            int cur_a,
+                            int mapping_stride) {
+    return hmx_mm_id_2d_f32_ex(ctx, dst, activation, weight,
+                                   m, k, n, k_valid, ne11,
+                                   act_nb1, act_nb2, dst_nb1, dst_nb2,
+                                   weight_stride, weight_type,
+                                   matrix_rows, cur_a, mapping_stride,
+                                   NULL, 0, NULL, NULL, NULL);
 }
 
 // --- Dispatchers and Public Entry Points ---
@@ -3105,19 +3175,32 @@ static int hmx_mm_op_matmul_id(
         const int32_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) continue;
 
-        if (mmctx->mmid_hybrid && !mmid_is_hmx_worthy(mmctx, (uint32_t) cne1)) {
+        if (mmctx->mmid_parallel) {
+            // v2: HMX owns every expert except the small helper set.
+            if (mmctx->mmid_hvx_expert_mask != NULL &&
+                mmctx->mmid_hvx_expert_mask[cur_a] != 0) {
+                continue;
+            }
+        } else if (mmctx->mmid_hybrid &&
+                   !mmid_is_hmx_worthy(mmctx, (uint32_t) cne1)) {
+            // Existing serial-hybrid behavior.
             continue;
         }
 
-        int ret = hmx_mm_id_2d_f32(octx->ctx, (float*) dst->data, (float*) src1->data,
-                                   (const uint8_t *) src0->data + cur_a * nb02,
-                                   cne1, ne00, ne01,
-                                   ne10,
-                                   ne11,
-                                   nb11, nb12,
-                                   nb1, nb2,
-                                   (int) src0->nb[1], (int) src0->type,
-                                   matrix_rows, cur_a, n_ids * octx->src[2]->ne[1]);
+         int ret = hmx_mm_id_2d_f32_ex(octx->ctx, (float*) dst->data, (float*) src1->data,
+                               (const uint8_t *) src0->data + cur_a * nb02,
+                               cne1, ne00, ne01,
+                               ne10,
+                               ne11,
+                               nb11, nb12,
+                               nb1, nb2,
+                               (int) src0->nb[1], (int) src0->type,
+                               matrix_rows, cur_a, n_ids * octx->src[2]->ne[1],
+                               mmctx->hmx_vtcm_base,
+                               mmctx->hmx_vtcm_size,
+                               mmctx->hmx_overlap_fn,
+                               mmctx->hmx_overlap_opaque,
+                               &mmctx->hmx_overlap_done);
         if (ret != 0) {
             FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);
             if (must_free_mapping) free(mapping_buf);
@@ -3181,13 +3264,14 @@ static int hvx_mm_matmul_id(
          src1->data, dst->data);
 
     // Make sure the reserved vtcm size is sufficient
-    if (octx->ctx->vtcm_size < vtcm_size) {
-        FARF(ERROR, "matmul-id-%s : current VTCM reservation %zu is too small, needed %zu\n", mmctx->type, octx->ctx->vtcm_size, vtcm_size);
+    const size_t vtcm_limit = mmctx->vtcm_size_override ? mmctx->vtcm_size_override : octx->ctx->vtcm_size;
+    uint8_t * const base = mmctx->vtcm_base_override ? mmctx->vtcm_base_override : (uint8_t *) octx->ctx->vtcm_base;
+    if (vtcm_limit < vtcm_size) {
+        FARF(ERROR, "matmul-id-%s : VTCM subregion %zu is too small, needed %zu\n", mmctx->type, vtcm_limit, vtcm_size);
         if (must_free_mapping) free(mapping_buf);
         return HTP_STATUS_VTCM_TOO_SMALL;
     }
 
-    uint8_t * const base = (uint8_t *) octx->ctx->vtcm_base;
     mmctx->vtcm_src1 = VTCM_LAYOUT_PTR(uint8_t, base, L.off_src1);
     mmctx->vtcm_src0 = VTCM_LAYOUT_PTR(uint8_t, base, L.off_src0);
     mmctx->vtcm_src2 = NULL;
@@ -3201,6 +3285,7 @@ static int hvx_mm_matmul_id(
     mmctx->vtcm_src0_stride = src0_row_size_padded;
     mmctx->vtcm_src1_stride = src1_row_size;
 
+    // Parallel HVX may use fewer threads than the global HTP context.
     mmctx->vtcm_src0_size_per_thread = L.src0_bytes / octx->n_threads;
     mmctx->vtcm_src1_size_per_thread = L.src1_bytes;
     mmctx->vtcm_src2_size_per_thread = 0;
@@ -3229,6 +3314,248 @@ static inline bool mmid_hybrid_hvx_supported(enum htp_data_type type) {
         default:
             return false;
     }
+}
+
+#define HTP_MM_MOE_PAR_MIN_PREFILL_ROWS        32u
+// v2: HVX is only an opportunistic side engine.
+#define HTP_MM_MOE_PAR_HVX_THREADS              1u
+#define HTP_MM_MOE_PAR_HVX_MAX_ROWS_PER_EXPERT  8u
+#define HTP_MM_MOE_PAR_HVX_MAX_EXPERTS          4u
+#define HTP_MM_MOE_PAR_HVX_MAX_TOTAL_ROWS       32u
+#define HTP_MM_MOE_PAR_MAX_MODEL_EXPERTS        256u
+// Refuse parallelism if the HVX reservation leaves HMX with <85% VTCM.
+#define HTP_MM_MOE_PAR_HMX_MIN_VTCM_PCT         85u
+
+struct mmid_parallel_state {
+    struct htp_ops_context hvx_octx;
+    struct htp_mm_context  hvx_mmctx;
+    size_t   src0_row_size_padded;
+    uint32_t src1_nrows;
+    void   * mapping_buf;
+    int      hvx_status;
+    bool     hvx_ran;
+    uint32_t n_as;
+    uint32_t total_rows;
+    uint32_t hvx_expert_count;
+    uint32_t hvx_rows;
+    uint8_t  hvx_expert_mask[HTP_MM_MOE_PAR_MAX_MODEL_EXPERTS];
+};
+
+static bool mmid_select_hvx_helpers(
+    struct mmid_parallel_state * st,
+    const uint32_t * matrix_row_counts,
+    uint32_t n_as
+) {
+    if (n_as == 0 || n_as > HTP_MM_MOE_PAR_MAX_MODEL_EXPERTS) {
+        return false;
+    }
+
+    memset(st->hvx_expert_mask, 0, sizeof(st->hvx_expert_mask));
+    st->n_as = n_as;
+    st->total_rows = 0;
+    st->hvx_expert_count = 0;
+    st->hvx_rows = 0;
+
+    for (uint32_t e = 0; e < n_as; ++e) {
+        st->total_rows += matrix_row_counts[e];
+    }
+
+    // Pick the coldest eligible experts first, with hard caps on both
+    // expert count and routed rows.
+    while (st->hvx_expert_count < HTP_MM_MOE_PAR_HVX_MAX_EXPERTS &&
+           st->hvx_rows < HTP_MM_MOE_PAR_HVX_MAX_TOTAL_ROWS) {
+        uint32_t best_e = UINT32_MAX;
+        uint32_t best_rows = UINT32_MAX;
+
+        for (uint32_t e = 0; e < n_as; ++e) {
+            const uint32_t rows = matrix_row_counts[e];
+
+            if (rows == 0 ||
+                rows > HTP_MM_MOE_PAR_HVX_MAX_ROWS_PER_EXPERT ||
+                st->hvx_expert_mask[e] != 0) {
+                continue;
+            }
+
+            if (st->hvx_rows + rows > HTP_MM_MOE_PAR_HVX_MAX_TOTAL_ROWS) {
+                continue;
+            }
+
+            if (rows < best_rows) {
+                best_rows = rows;
+                best_e = e;
+            }
+        }
+
+        if (best_e == UINT32_MAX) {
+            break;
+        }
+
+        st->hvx_expert_mask[best_e] = 1;
+        st->hvx_expert_count++;
+        st->hvx_rows += best_rows;
+    }
+
+    return st->hvx_expert_count > 0;
+}
+
+static int mmid_parallel_hvx_callback(void * opaque) {
+    struct mmid_parallel_state * st = (struct mmid_parallel_state *) opaque;
+    if (st->hvx_ran) return st->hvx_status;
+    st->hvx_ran = true;
+    // One small helper pass only. Repeated full hvx_mm_matmul_id() calls would
+    // risk redoing activation quantization/VTCM setup.
+    FARF(ERROR,
+         "[MOE-PAR-v2] HVX helper start experts=%u rows=%u threads=%u vtcm=%zu",
+         st->hvx_expert_count, st->hvx_rows,
+         st->hvx_octx.n_threads, st->hvx_mmctx.vtcm_size_override);
+
+    st->hvx_status = hvx_mm_matmul_id(
+        &st->hvx_octx,
+        &st->hvx_mmctx,
+        st->src0_row_size_padded,
+        st->src1_nrows,
+        hvx_mm_id,
+        st->mapping_buf,
+        false);
+
+    FARF(ERROR, "[MOE-PAR-v2] HVX helper done status=%d", st->hvx_status);
+    return st->hvx_status;
+}
+
+static bool mmid_prepare_parallel_state(
+    struct htp_ops_context * octx,
+    struct htp_mm_context * hmx_mmctx,
+    struct mmid_parallel_state * st,
+    const uint32_t * matrix_row_counts,
+    uint32_t n_as,
+    size_t src0_row_size_padded,
+    uint32_t src1_nrows,
+    void * mapping_buf
+) {
+    htp_matmul_tensors_preamble;
+    if (src1_nrows < HTP_MM_MOE_PAR_MIN_PREFILL_ROWS) return false;
+
+    memset(st, 0, sizeof(*st));
+    if (!mmid_select_hvx_helpers(st, matrix_row_counts, n_as)) {
+        FARF(ERROR,
+             "[MOE-PAR-v2] reject: no eligible cold experts "
+             "n_as=%u src1_nrows=%u",
+             n_as,
+             src1_nrows);
+        return false;
+    }
+
+    FARF(ERROR,
+         "[MOE-PAR-v2] helper candidate: "
+         "experts=%u rows=%u total_rows=%u",
+         st->hvx_expert_count,
+         st->hvx_rows,
+         st->total_rows);
+
+    const struct htp_mm_kernel_params * src_kparams =
+        (const struct htp_mm_kernel_params *) octx->kernel_params;
+    const uint32_t max_threads =
+        MIN((uint32_t)octx->n_threads, (uint32_t)HTP_MM_MOE_PAR_HVX_THREADS);
+    const size_t src0_row_size = src0->nb[1];
+    const size_t src1_row_size = src0->type == HTP_TYPE_Q4_1 ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+
+    for (uint32_t hvx_threads = max_threads; hvx_threads >= 1; --hvx_threads) {
+        struct htp_mm_kernel_params hvx_kparams = *src_kparams;
+        hvx_kparams.n_hmx = 0;
+        hvx_kparams.kernel_type = src1_nrows < hvx_threads ? HTP_MM_KERNEL_HVX_QUANT_BLOCK : HTP_MM_KERNEL_HVX_QUANT_ROW;
+        hvx_kparams.n_prefetch = 2;
+        hvx_kparams.vtcm_size = 0;
+
+        struct htp_mm_hvx_vtcm_layout L;
+        htp_mm_hvx_vtcm_layout_build(&L, hvx_kparams.kernel_type, src0->type, ne10, src1_nrows, hvx_threads,
+                                     0, src0_row_size, src1_row_size, 0, hvx_kparams.n_prefetch, true, false);
+        const size_t hvx_bytes = hex_align_up(L.total_bytes, 128);
+        if (hvx_bytes >= octx->ctx->vtcm_size) {
+            FARF(ERROR,
+         "[MOE-PAR-v2] reject VTCM: "
+         "hvx=%zu >= total=%zu",
+         hvx_bytes,
+         octx->ctx->vtcm_size);
+            continue;
+        }
+        const size_t hmx_bytes =
+            (octx->ctx->vtcm_size - hvx_bytes) & ~(size_t)127;
+
+        const uint32_t hmx_pct =
+            (uint32_t)(
+                hmx_bytes * 100u /
+                octx->ctx->vtcm_size);
+
+        FARF(ERROR,
+             "[MOE-PAR-v2] VTCM candidate: "
+             "threads=%u total=%zu hvx=%zu hmx=%zu "
+             "hmx_pct=%u%% required=%u%%",
+             hvx_threads,
+             octx->ctx->vtcm_size,
+             hvx_bytes,
+             hmx_bytes,
+             hmx_pct,
+             HTP_MM_MOE_PAR_HMX_MIN_VTCM_PCT);
+
+        if (hmx_bytes * 100u <
+            octx->ctx->vtcm_size * HTP_MM_MOE_PAR_HMX_MIN_VTCM_PCT) {
+            FARF(ERROR,
+         "[MOE-PAR-v2] reject VTCM: "
+         "HMX remaining %u%% < %u%%",
+         hmx_pct,
+         HTP_MM_MOE_PAR_HMX_MIN_VTCM_PCT);
+            continue;
+        }
+
+        // kernel_params is inline in htp_ops_context, so this is a real copy.
+        st->hvx_octx = *octx;
+        st->hvx_octx.n_threads = hvx_threads;
+        memcpy(st->hvx_octx.kernel_params, &hvx_kparams, sizeof(hvx_kparams));
+
+        st->hvx_mmctx = *hmx_mmctx;
+        st->hvx_mmctx.octx = &st->hvx_octx;
+        st->hvx_mmctx.vtcm_base_override = (uint8_t *)octx->ctx->vtcm_base + hmx_bytes;
+        st->hvx_mmctx.vtcm_size_override = hvx_bytes;
+        st->hvx_mmctx.mmid_parallel = true;
+        st->hvx_mmctx.mmid_hvx_expert_mask = st->hvx_expert_mask;
+        st->hvx_mmctx.hmx_overlap_fn = NULL;
+        st->hvx_mmctx.hmx_overlap_opaque = NULL;
+        st->hvx_mmctx.hmx_overlap_done = true;
+        st->hvx_mmctx.src0_nrows_per_thread = hex_round_up((src0->ne[1] + hvx_threads - 1) / hvx_threads, 32);
+        if (hvx_mm_init_vec_dot(&st->hvx_mmctx, src0->type) != 0) continue;
+
+        st->src0_row_size_padded = src0_row_size_padded;
+        st->src1_nrows = src1_nrows;
+        st->mapping_buf = mapping_buf;
+        st->hvx_status = HTP_STATUS_INTERNAL_ERR;
+        st->hvx_ran = false;
+
+        hmx_mmctx->mmid_parallel = true;
+        hmx_mmctx->hmx_vtcm_base = (uint8_t *)octx->ctx->vtcm_base;
+        hmx_mmctx->hmx_vtcm_size = hmx_bytes;
+        hmx_mmctx->mmid_hvx_expert_mask = st->hvx_expert_mask;
+        hmx_mmctx->hmx_overlap_fn = mmid_parallel_hvx_callback;
+        hmx_mmctx->hmx_overlap_opaque = st;
+        hmx_mmctx->hmx_overlap_done = false;
+
+        FARF(ERROR,
+        "[MOE-PAR-v2] helper experts=%u rows=%u total-rows=%u "
+        "VTCM total=%zu HMX=%zu HVX=%zu HVX-threads=%u",
+        st->hvx_expert_count, st->hvx_rows, st->total_rows,
+             octx->ctx->vtcm_size, hmx_bytes, hvx_bytes, hvx_threads);
+        return true;
+    }
+    return false;
+}
+
+static inline void mmid_clear_parallel_state(struct htp_mm_context * mmctx) {
+    mmctx->mmid_parallel = false;
+    mmctx->hmx_vtcm_base = NULL;
+    mmctx->hmx_vtcm_size = 0;
+    mmctx->hmx_overlap_fn = NULL;
+    mmctx->hmx_overlap_opaque = NULL;
+    mmctx->hmx_overlap_done = false;
+    mmctx->mmid_hvx_expert_mask = NULL;
 }
 
 // Execute MUL_MAT_ID as two serial passes:
@@ -3307,6 +3634,71 @@ static int hmx_hvx_mm_op_matmul_id(
 
     int s = HTP_STATUS_OK;
 
+    // v2 prefill: preserve the all-HMX critical path and use HVX only as a
+    // tiny opportunistic helper. If helper setup is not safe, run all-HMX.
+    if (src1_nrows >= HTP_MM_MOE_PAR_MIN_PREFILL_ROWS) {
+        struct mmid_parallel_state pst;
+        if (mmid_prepare_parallel_state(
+                octx,
+                mmctx,
+                &pst,
+                matrix_row_counts,
+                (uint32_t)n_as,
+                src0_row_size_padded,
+                src1_nrows,
+                mapping_buf)) {
+
+            FARF(ERROR,
+                 "[MOE-PAR-v2] begin HMX-rows=%u HVX-helper-experts=%u rows=%u",
+                 pst.total_rows - pst.hvx_rows,
+                 pst.hvx_expert_count,
+                 pst.hvx_rows);
+
+            s = hmx_mm_op_matmul_id(
+                octx, mmctx,
+                matrix_row_counts, matrix_rows,
+                mapping_buf, false);
+            if (s == HTP_STATUS_OK && !pst.hvx_ran) {
+                (void) mmid_parallel_hvx_callback(&pst);
+            }
+            mmid_clear_parallel_state(mmctx);
+
+            if (s == HTP_STATUS_OK &&
+                pst.hvx_ran &&
+                pst.hvx_status == HTP_STATUS_OK) {
+                FARF(ERROR, "[MOE-PAR-v2] complete");
+                if (must_free_mapping) free(mapping_buf);
+                return HTP_STATUS_OK;
+            }
+
+            FARF(ERROR,
+                 "[MOE-PAR-v2] helper failed -> all-HMX hmx=%d hvx-ran=%d hvx=%d",
+                 s, (int)pst.hvx_ran, pst.hvx_status);
+        } else {
+            FARF(ERROR, "[MOE-PAR-v2] no safe helper set/VTCM -> all-HMX");
+        }
+
+        // Do NOT fall back to serial HMX->HVX for prefill: that was slower
+        // than baseline. Restore full-VTCM all-HMX execution.
+        mmctx->mmid_parallel = false;
+        mmctx->mmid_hybrid = false;
+        mmctx->mmid_hvx_expert_mask = NULL;
+        mmctx->hmx_vtcm_base = NULL;
+        mmctx->hmx_vtcm_size = 0;
+        mmctx->hmx_overlap_fn = NULL;
+        mmctx->hmx_overlap_opaque = NULL;
+        mmctx->hmx_overlap_done = false;
+
+        s = hmx_mm_op_matmul_id(
+            octx, mmctx,
+            matrix_row_counts, matrix_rows,
+            mapping_buf, false);
+
+        if (must_free_mapping) free(mapping_buf);
+        return s;
+    }
+
+    // Decode / very-small-token path keeps existing serial hybrid behavior.
     // Pass 1: HMX hot experts.
     if (n_hmx_experts > 0) {
        s = hmx_mm_op_matmul_id(
