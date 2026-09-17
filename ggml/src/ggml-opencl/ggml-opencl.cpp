@@ -36,6 +36,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -1408,10 +1409,15 @@ struct ggml_backend_opencl_context {
         return workgroup_size;
     }
 
-    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
+    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor, const size_t * global_work_offset = nullptr) {
+        for (cl_uint i = 0; i < work_dim; i++) {
+            if (global_work_size[i] == 0) {
+                return;
+            }
+        }
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, global_work_offset, global_work_size, local_work_size, 0, NULL, &evt));
 
         profiling_info.emplace_back();
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
@@ -1420,9 +1426,49 @@ struct ggml_backend_opencl_context {
         }
 #else
         GGML_UNUSED(tensor);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, global_work_offset, global_work_size, local_work_size, 0, NULL, NULL));
 #endif
         maybe_profile_moe_detail(kernel, work_dim, global_work_size, local_work_size, tensor);
+    }
+
+    void enqueue_moe_ndrange_kernel(cl_kernel kernel, size_t * global_work_size, size_t * local_work_size, const ggml_tensor * tensor) {
+        static const size_t tiles_per_dispatch = []() -> size_t {
+            const char * env = std::getenv("GGML_OPENCL_MOE_TILES_PER_DISPATCH");
+            if (env == nullptr || env[0] == '\0') {
+                return 0;
+            }
+
+            char * end = nullptr;
+            const unsigned long long parsed = std::strtoull(env, &end, 10);
+            if (end == env || *end != '\0') {
+                GGML_LOG_WARN("ggml_opencl: ignoring invalid GGML_OPENCL_MOE_TILES_PER_DISPATCH='%s'\n", env);
+                return 0;
+            }
+            return static_cast<size_t>(parsed);
+        }();
+
+        if (tiles_per_dispatch == 0 || global_work_size[2] <= tiles_per_dispatch) {
+            enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, tensor);
+            return;
+        }
+
+        // MoE GEMM kernels use get_global_id(2) as the post-router tile id.
+        // Split only Z and preserve that absolute tile id with global_work_offset.
+        GGML_ASSERT(local_work_size == nullptr || local_work_size[2] == 1);
+
+        const size_t total_tiles = global_work_size[2];
+        size_t chunk_global_work_size[3] = {
+            global_work_size[0],
+            global_work_size[1],
+            0,
+        };
+        size_t global_work_offset[3] = {0, 0, 0};
+
+        for (size_t tile_base = 0; tile_base < total_tiles; tile_base += tiles_per_dispatch) {
+            chunk_global_work_size[2] = MIN(tiles_per_dispatch, total_tiles - tile_base);
+            global_work_offset[2] = tile_base;
+            enqueue_ndrange_kernel(kernel, 3, chunk_global_work_size, local_work_size, tensor, global_work_offset);
+        }
     }
 
     const void * get_adreno_bin_kernel(const std::string &kernel_name, size_t *bin_size) const {
@@ -21281,7 +21327,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
 
                     // launch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     // deallocate sub buffers and images
                     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -21488,7 +21534,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)q4_0_max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
-                        backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
+                        backend_ctx->enqueue_moe_ndrange_kernel(dk, dp_global, dp_local, dst);
 
                         clReleaseMemObject(sub_buf_src1_pre);
                         clReleaseMemObject(buf_src2);
@@ -21522,7 +21568,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     local_size[2] = 1;
 
                     // Dispatch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
                     // Probe matches the source FP16 kernel only.
                     // DP4A has returned above; skip when the binary kernel is active.
                     if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr) {
@@ -21642,7 +21688,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
 
                     // launch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     // deallocate sub buffers and images
                     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -21762,7 +21808,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     local_size[2] = 1;
 
                     // Dispatch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);
@@ -21828,7 +21874,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
 
                     // launch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     // deallocate sub buffers and images
                     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -21930,7 +21976,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                             size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
                             size_t dp_local[3]  = { 64, 1, 1 };
-                            backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
+                            backend_ctx->enqueue_moe_ndrange_kernel(dk, dp_global, dp_local, dst);
 
                             clReleaseMemObject(sub_buf_src1_pre);
                             clReleaseMemObject(buf_src2);
@@ -22015,7 +22061,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     local_size[2] = 1;
 
                     // Dispatch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);
@@ -22082,7 +22128,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
 
                     // launch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     // deallocate sub buffers and images
                     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -22194,7 +22240,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     local_size[2] = 1;
 
                     // Dispatch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);
@@ -22312,7 +22358,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
-                        backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
+                        backend_ctx->enqueue_moe_ndrange_kernel(dk, dp_global, dp_local, dst);
 
                         clReleaseMemObject(sub_buf_src1_pre);
                         clReleaseMemObject(buf_src2);
@@ -22374,7 +22420,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 local_size[1]  = 1;
                 local_size[2]  = 1;
 
-                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                 clReleaseMemObject(sub_buf_src1_pre);
                 clReleaseMemObject(buf_src1_reordered);
@@ -22526,7 +22572,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
 
                     // launch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     // deallocate sub buffers and images
                     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -22676,7 +22722,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
-                        backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
+                        backend_ctx->enqueue_moe_ndrange_kernel(dk, dp_global, dp_local, dst);
 
                         clReleaseMemObject(sub_buf_src1_pre);
                         clReleaseMemObject(buf_src2);
@@ -22709,7 +22755,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     local_size[2] = 1;
 
                     // Dispatch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);
@@ -22777,7 +22823,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
 
                     // launch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     // deallocate sub buffers and images
                     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -22881,7 +22927,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                             size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
                             size_t dp_local[3]  = { 64, 1, 1 };
-                            backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
+                            backend_ctx->enqueue_moe_ndrange_kernel(dk, dp_global, dp_local, dst);
 
                             clReleaseMemObject(sub_buf_src1_pre);
                             clReleaseMemObject(buf_src2);
@@ -22966,7 +23012,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     local_size[2] = 1;
 
                     // Dispatch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);
@@ -23033,7 +23079,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
 
                     // launch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     // deallocate sub buffers and images
                     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -23173,7 +23219,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
-                        backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
+                        backend_ctx->enqueue_moe_ndrange_kernel(dk, dp_global, dp_local, dst);
 
                         clReleaseMemObject(sub_buf_src1_pre);
                         clReleaseMemObject(buf_src2);
@@ -23206,7 +23252,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     local_size[2] = 1;
 
                     // Dispatch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);
@@ -23280,7 +23326,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
 
                     // launch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     // deallocate sub buffers and images
                     CL_CHECK(clReleaseMemObject(src1_sub_buffer));
@@ -23434,7 +23480,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                         size_t dp_global[3] = { 64, (size_t)((ne01 + 63) / 64), (size_t)max_post_router_tile };
                         size_t dp_local[3]  = { 64, 1, 1 };
-                        backend_ctx->enqueue_ndrange_kernel(dk, 3, dp_global, dp_local, dst);
+                        backend_ctx->enqueue_moe_ndrange_kernel(dk, dp_global, dp_local, dst);
 
                         clReleaseMemObject(sub_buf_src1_pre);
                         clReleaseMemObject(buf_src2);
@@ -23465,7 +23511,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     local_size[2] = 1;
 
                     // Dispatch kernel
-                    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                    backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);
