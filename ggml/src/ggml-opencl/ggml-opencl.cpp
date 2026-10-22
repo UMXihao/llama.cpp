@@ -13,6 +13,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+#include "moe-wimg-kernels.h"
+#endif
 #ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
 #include "libdl.h"
 #ifdef _WIN32
@@ -968,6 +971,11 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gated_delta_net_f32[4][2][2] = {};
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns, kernel_gemm_moe_q4_0_f32_ns_4x8, kernel_gemm_moe_q4_0_f32_ns_bin;    cl_kernel kernel_moe_q4_0_weight_load_probe = nullptr;
+    cl_kernel kernel_moe_q_wimg2d_pack = nullptr;
+    cl_kernel kernel_gemv_moe_q4_0_f32_img2d = nullptr;
+    cl_kernel kernel_gemv_moe_q4_k_f32_img2d = nullptr;
+    cl_kernel kernel_gemv_moe_q4_0_f32_img2d_row = nullptr;
+    cl_kernel kernel_gemv_moe_q4_k_f32_img2d_row = nullptr;
     cl_kernel kernel_gemm_moe_q8_0_f32_ns;
     cl_kernel kernel_gemv_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns, kernel_gemm_moe_q4_1_f32_ns_bin;
     cl_kernel kernel_gemv_moe_q5_0_f32_ns, kernel_gemm_moe_q5_0_f32_ns;
@@ -4530,6 +4538,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    // Optional experimental MoE Q4 weight image2d kernels. The original
+    // trans4_ns buffers remain untouched for GEMM and readback.
+    {
+        cl_program prog = build_program_from_source(backend_ctx->context, backend_ctx->device, ggml_cl_moe_wimg2d_kernel_source, CL_moe_compile_opts);
+        CL_CHECK((backend_ctx->kernel_moe_q_wimg2d_pack = clCreateKernel(prog, "kernel_moe_q_wimg2d_pack", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_q4_0_f32_img2d = clCreateKernel(prog, "kernel_gemv_moe_q4_0_f32_img2d", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_img2d = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_img2d", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_q4_0_f32_img2d_row = clCreateKernel(prog, "kernel_gemv_moe_q4_0_f32_img2d_row", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_moe_q4_k_f32_img2d_row = clCreateKernel(prog, "kernel_gemv_moe_q4_k_f32_img2d_row", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+#endif
 
     // gemm_moe_q4_k_f32_ns
     {
@@ -6563,10 +6585,24 @@ struct ggml_tensor_extra_cl_q1_0 {
 };
 
 // Additional tensor extra structs for quantized tensors.
+struct ggml_cl_moe_wimg2d {
+    cl_mem image = nullptr;
+    cl_uint layout = 0;
+    cl_uint experts_per_row = 1;
+    cl_uint bm = 64;
+    cl_uint bkq = 32;
+    void reset() {
+        if (image) {
+            CL_CHECK(clReleaseMemObject(image));
+            image = nullptr;
+        }
+    }
+};
 // These tensors are loaded from files and should not be allocated in scratch --
 // they should always be allocated from the pool. Hence, they do not have an
 // `offset`, which indicate their locations in the scratch buffer.
 struct ggml_tensor_extra_cl_q4_0 {
+    ggml_cl_moe_wimg2d moe_wimg2d;
     // Quantized values.
     cl_mem q = nullptr;
     // Quantized values in image1d_buffer_t.
@@ -6600,6 +6636,7 @@ struct ggml_tensor_extra_cl_q4_0 {
             CL_CHECK(clReleaseMemObject(q_img));
             q_img = nullptr;
         }
+        moe_wimg2d.reset();
         // Currently, q_img and d_img are only initialized when SMALL_ALLOC is
         // enabled. They point to the images in ggml_backend_opencl_buffer_context.
         // So, there is no need to release them here.
@@ -6905,6 +6942,7 @@ struct ggml_tensor_extra_cl_iq4_nl {
 };
 
 struct ggml_tensor_extra_cl_q4_K {
+    ggml_cl_moe_wimg2d moe_wimg2d;
     // Quantized values
     cl_mem q = nullptr;
     // Quantized values in image1d_buffer_t.
@@ -6941,6 +6979,7 @@ struct ggml_tensor_extra_cl_q4_K {
             CL_CHECK(clReleaseMemObject(q_img));
             q_img = nullptr;
         }
+        moe_wimg2d.reset();
     }
 };
 
@@ -7014,6 +7053,142 @@ struct ggml_tensor_extra_cl_q5_K {
         size_dm = 0;
     }
 };
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+// -1 => preserve upstream paths; 0/1/2 => row/oc/block image2d.
+static int ggml_cl_moe_wimg2d_layout() {
+    static const int layout = []() {
+        const char * s = getenv("GGML_OPENCL_MOE_WIMG_LAYOUT");
+        if (!s || !s[0] || strcmp(s, "default") == 0) return -1;
+        if (strcmp(s, "row") == 0 || strcmp(s, "row-major") == 0) {
+            GGML_LOG_INFO("ggml_opencl: MoE weight image layout = row-major (specialized decode)\n");
+            return 0;
+        }
+        if (strcmp(s, "oc") == 0 || strcmp(s, "output-channel-major") == 0) return 1;
+        if (strcmp(s, "block") == 0 || strcmp(s, "2d-block") == 0) return 2;
+        GGML_LOG_WARN("ggml_opencl: unknown GGML_OPENCL_MOE_WIMG_LAYOUT='%s', ignoring\n", s);
+        return -1;
+    }();
+    return layout;
+}
+
+// Build an independent image: q remains OC-major for all existing GEMM,
+// binary-kernel and restore paths. A dedicated repack buffer is released
+// after the CL queue copies it into the 2D image.
+static void ggml_cl_prepare_moe_wimg2d(
+        ggml_backend_opencl_context * backend_ctx, cl_command_queue queue,
+        const ggml_tensor * tensor, cl_mem original_q, ggml_cl_moe_wimg2d & out) {
+    const int chosen = ggml_cl_moe_wimg2d_layout();
+    if (chosen < 0 || !backend_ctx->kernel_moe_q_wimg2d_pack || out.image) return;
+    if (tensor->ne[3] != 1 || tensor->ne[2] <= 1 || tensor->ne[0] % 32 != 0 ||
+            tensor->ne[1] % 64 != 0) return;
+
+    const cl_uint QW = (cl_uint)tensor->ne[0] / 8;
+    const cl_uint M  = (cl_uint)tensor->ne[1];
+    const cl_uint E  = (cl_uint)tensor->ne[2];
+    const cl_uint layout = (cl_uint)chosen;
+    const cl_uint bm = 64;
+    cl_uint bkq = QW % 32 == 0 ? 32 : QW % 16 == 0 ? 16 :
+                   QW % 8 == 0 ? 8 : QW % 4 == 0 ? 4 :
+                   QW % 2 == 0 ? 2 : 1;
+    size_t ew = 0, eh = 0;
+    if (layout == 0) {
+        ew = QW; eh = M;
+    } else if (layout == 1) {
+        ew = M; eh = QW;
+    } else {
+        ew = (size_t)bm * bkq;
+        eh = (size_t)(M / bm) * (QW / bkq);
+    }
+
+    cl_bool image_support = CL_FALSE;
+    size_t max_w = 0, max_h = 0;
+    if (clGetDeviceInfo(backend_ctx->device, CL_DEVICE_IMAGE_SUPPORT,
+                        sizeof(image_support), &image_support, nullptr) != CL_SUCCESS || !image_support ||
+        clGetDeviceInfo(backend_ctx->device, CL_DEVICE_IMAGE2D_MAX_WIDTH,
+                        sizeof(max_w), &max_w, nullptr) != CL_SUCCESS ||
+        clGetDeviceInfo(backend_ctx->device, CL_DEVICE_IMAGE2D_MAX_HEIGHT,
+                        sizeof(max_h), &max_h, nullptr) != CL_SUCCESS) return;
+
+    cl_uint epc = 0;
+    size_t width = 0, height = 0;
+    for (cl_uint n = E; n > 0; --n) {
+        if (E % n != 0) continue;
+        const size_t w = ew * n;
+        const size_t h = eh * (E / n);
+        if (w <= max_w && h <= max_h) {
+            epc = n; width = w; height = h;
+            break;
+        }
+    }
+    if (!epc || (size_t)E * M * QW > UINT32_MAX) {
+        GGML_LOG_WARN("ggml_opencl: MoE 2D image dimensions unavailable for %s; use upstream path\n", tensor->name);
+        return;
+    }
+    const size_t n_pixels = (size_t)E * M * QW;
+    if (width * height != n_pixels) return;
+
+    cl_image_format fmt = {CL_R, CL_UNSIGNED_INT32};
+    cl_image_desc desc = {};
+    desc.image_type = CL_MEM_OBJECT_IMAGE2D;
+    desc.image_width = width;
+    desc.image_height = height;
+    cl_int status = CL_SUCCESS;
+    cl_mem image = clCreateImage(backend_ctx->context, CL_MEM_READ_ONLY,
+                                  &fmt, &desc, nullptr, &status);
+    if (status != CL_SUCCESS || !image) {
+        GGML_LOG_WARN("ggml_opencl: no MoE image2d for %s (CL error %d)\n", tensor->name, status);
+        return;
+    }
+    cl_mem packed = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE,
+                                   n_pixels * sizeof(cl_uint), nullptr, &status);
+    if (status != CL_SUCCESS || !packed) {
+        CL_CHECK(clReleaseMemObject(image));
+        return;
+    }
+
+    cl_kernel kernel = backend_ctx->kernel_moe_q_wimg2d_pack;
+    const cl_uint image_width = (cl_uint)width;
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &original_q));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &packed));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(QW), &QW));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(M), &M));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(E), &E));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(layout), &layout));
+    CL_CHECK(clSetKernelArg(kernel, 6, sizeof(epc), &epc));
+    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(bm), &bm));
+    CL_CHECK(clSetKernelArg(kernel, 8, sizeof(bkq), &bkq));
+    CL_CHECK(clSetKernelArg(kernel, 9, sizeof(image_width), &image_width));
+    const size_t local_size = 64;
+    const size_t global_size = ((n_pixels + local_size - 1) / local_size) * local_size;
+    cl_event repack_event = nullptr;
+    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &global_size,
+                                    &local_size, 0, nullptr, &repack_event));
+    const size_t origin[3] = {0, 0, 0};
+    const size_t region[3] = {width, height, 1};
+    status = clEnqueueCopyBufferToImage(queue, packed, image, 0,
+                                        origin, region, 1, &repack_event, nullptr);
+    CL_CHECK(clReleaseEvent(repack_event));
+    CL_CHECK(clReleaseMemObject(packed));
+    if (status != CL_SUCCESS) {
+        GGML_LOG_WARN("ggml_opencl: image2d upload failed for %s (CL error %d)\n", tensor->name, status);
+        CL_CHECK(clReleaseMemObject(image));
+        return;
+    }
+    out.image = image;
+    out.layout = layout;
+    out.experts_per_row = epc;
+    out.bm = bm;
+    out.bkq = bkq;
+}
+
+static void ggml_cl_set_moe_wimg2d_args(cl_kernel kernel, int start,
+                                        const ggml_cl_moe_wimg2d & img) {
+    CL_CHECK(clSetKernelArg(kernel, start + 0, sizeof(img.layout), &img.layout));
+    CL_CHECK(clSetKernelArg(kernel, start + 1, sizeof(img.experts_per_row), &img.experts_per_row));
+    CL_CHECK(clSetKernelArg(kernel, start + 2, sizeof(img.bm), &img.bm));
+    CL_CHECK(clSetKernelArg(kernel, start + 3, sizeof(img.bkq), &img.bkq));
+}
+#endif  // GGML_OPENCL_USE_ADRENO_KERNELS
 
 struct ggml_tensor_extra_cl_q6_K {
     // Lower 4 bits of quantized weights.
@@ -8501,6 +8676,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 { extra->q }
             };
             extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
+            ggml_cl_prepare_moe_wimg2d(backend_ctx, queue, tensor, extra->q, extra->moe_wimg2d);
             tensor->extra = extra;
             // MoE tensors are also SOA'ed
             ctx->q4_0_soa_tensors.insert(tensor);
@@ -9395,6 +9571,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             };
             extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
             CL_CHECK(err);
+            ggml_cl_prepare_moe_wimg2d(backend_ctx, queue, tensor, extra->q, extra->moe_wimg2d);
             tensor->extra = extra;
 
             return;
@@ -21277,7 +21454,11 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t global_size[3] = {64, 2, 1};
 
                 if (ne12 == 1) { // for gemv
-                    kernel = backend_ctx->kernel_gemv_moe_q4_0_f32_ns;
+                    const bool use_moe_wimg2d = extra0_q4_0->moe_wimg2d.image != nullptr;
+                    kernel = use_moe_wimg2d ? (extra0_q4_0->moe_wimg2d.layout == 0 ?
+                        backend_ctx->kernel_gemv_moe_q4_0_f32_img2d_row
+                        : backend_ctx->kernel_gemv_moe_q4_0_f32_img2d)
+                    : backend_ctx->kernel_gemv_moe_q4_0_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
 
@@ -21308,7 +21489,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Set kernel args
                     int arg_idx = 0;
-                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_0->q));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    use_moe_wimg2d ? &extra0_q4_0->moe_wimg2d.image : &extra0_q4_0->q));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_0->d));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &buf_src1_image));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &buf_src2));
@@ -21317,7 +21498,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
-
+                    if (use_moe_wimg2d) {
+                        ggml_cl_set_moe_wimg2d_args(kernel, arg_idx, extra0_q4_0->moe_wimg2d);
+                    }
                     // launch kernel
                     backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
@@ -22462,6 +22645,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t global_size[3] = {64, 2, 1};
 
                 if (ne12 == 1) { // for gemv
+                    const bool use_moe_wimg2d = extra0_q4_K->moe_wimg2d.image != nullptr;
                     kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns;
 
                     // Weight-as-texture MoE decode GEMV
@@ -22472,7 +22656,10 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     const bool use_moe_decode_wimg = moe_decode_wimg_on
                         && backend_ctx->kernel_gemv_moe_q4_k_f32_ns_wimg != nullptr
                         && extra0_q4_K->q_img != nullptr;
-                    if (use_moe_decode_wimg) {
+                    if (use_moe_wimg2d) {
+                        kernel = extra0_q4_K->moe_wimg2d.layout == 0 ? backend_ctx->kernel_gemv_moe_q4_k_f32_img2d_row
+                            : backend_ctx->kernel_gemv_moe_q4_k_f32_img2d;
+                    } else if (use_moe_decode_wimg) {
                         kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns_wimg;
                     }
 
@@ -22505,7 +22692,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Set kernel args
                     int arg_idx = 0;
-                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    use_moe_decode_wimg ? &extra0_q4_K->q_img : &extra0_q4_K->q));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    use_moe_wimg2d ? &extra0_q4_K->moe_wimg2d.image : (use_moe_decode_wimg ? &extra0_q4_K->q_img : &extra0_q4_K->q)));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_K->d));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_K->dm));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_K->s));
@@ -22516,7 +22703,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
-
+                    if (use_moe_wimg2d) {
+                        ggml_cl_set_moe_wimg2d_args(kernel, arg_idx, extra0_q4_K->moe_wimg2d);
+                    }
                     // launch kernel
                     backend_ctx->enqueue_moe_ndrange_kernel(kernel, global_size, local_size, dst);
 
