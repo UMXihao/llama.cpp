@@ -326,6 +326,25 @@ kernel void kernel_gemm_moe_q4_0_f32_ns(
 // Diagnostic-only: replay one token tile and touch only the Q4_0 expert weights.
 // Host-side CL event timing of a z-size=1 launch is reported as that tile's
 // isolated expert-weight load wall time.
+#define Q4_0_PROBE_LOAD_EXPERT_16(EXPERT_ID, Q_STEP) do { \
+    const uint _expert_base = (uint)(EXPERT_ID) * ne00 * ne01; \
+    const uint _q_sub_offset = row + ((ne01 * (Q_STEP)) >> 3) + (_expert_base >> 3); \
+    const uint _s_sub_offset = row + ((ne01 * step) >> 5) + (_expert_base >> 5); \
+    const half _scale = src0_d[_s_sub_offset + get_global_id(0)]; \
+    const uint _q0 = read_imageui(src0_q, _q_sub_offset + sub_block_id_m).x; \
+    const uint _q1 = read_imageui(src0_q, _q_sub_offset + sub_block_id_m + ne01).x; \
+    checksum = rotate(checksum ^ _q0, 5u) ^ _q1; \
+    checksum ^= (uint)as_ushort(_scale); \
+} while (0)
+
+#define Q4_0_PROBE_8X4_PAIR(Q_STEP, EXPERT_LO, EXPERT_HI) do { \
+    Q4_0_PROBE_LOAD_EXPERT_16((EXPERT_LO), (Q_STEP)); \
+    if ((EXPERT_LO) != (EXPERT_HI)) { \
+        Q4_0_PROBE_LOAD_EXPERT_16((EXPERT_HI), (Q_STEP)); \
+    } \
+} while (0)
+
+__attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_moe_q4_0_weight_load_probe(
         __read_only image1d_buffer_t src0_q,
         __global half *              src0_d,
@@ -341,52 +360,43 @@ kernel void kernel_moe_q4_0_weight_load_probe(
         return;
     }
 
+    // 8x4 layout: 32 token positions / 4 positions per expert slot.
+    const uint emap_base = block_id_n * (TILESIZE_N / 4);
+    const ushort expert4_0 = src2_emap[emap_base + 0];
+    const ushort expert4_1 = src2_emap[emap_base + 1];
+    const ushort expert4_2 = src2_emap[emap_base + 2];
+    const ushort expert4_3 = src2_emap[emap_base + 3];
+    const ushort expert4_4 = src2_emap[emap_base + 4];
+    const ushort expert4_5 = src2_emap[emap_base + 5];
+    const ushort expert4_6 = src2_emap[emap_base + 6];
+    const ushort expert4_7 = src2_emap[emap_base + 7];
+
     const ushort expert_id = src2_emap[block_id_n];
     const uint row = block_id_m * TILESIZE_M;
     const uint sub_block_id_m = get_local_id(0);
 
-    uint checksum = 0x9e3779b9u ^ (uint) expert_id;
 
-    // Match the source FP16 MoE kernel's expert-weight traversal.
-    for (uint step = 0; step < ne00; step += TILESIZE_K * 2) {
-        uint q_sub_offset =
-            row +
-            ((ne01 * step) >> 3) +
-            ((expert_id * ne00 * ne01) >> 3);
+    uint checksum = 0x9e3779b9u ^ (uint)expert4_0;
+    for (uint step = 0; step < ne00; step += TILESIZE_K * 2) {  
 
-        const uint s_sub_offset =
-            row +
-            ((ne01 * step) >> 5) +
-            ((expert_id * ne00 * ne01) >> 5);
+        // Same four adjacent pairs and order as Q4_0_PROCESS_8X4_HALF.
+        Q4_0_PROBE_8X4_PAIR(step, expert4_0, expert4_1);
+        Q4_0_PROBE_8X4_PAIR(step, expert4_2, expert4_3);
+        Q4_0_PROBE_8X4_PAIR(step, expert4_4, expert4_5);
+        Q4_0_PROBE_8X4_PAIR(step, expert4_6, expert4_7);
 
-        // One Q4_0 scale for this 32-element K block.
-        const half s = src0_d[s_sub_offset + get_global_id(0)];
-
-        // First 16 q values.
-        uint q0 = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
-        uint q1 = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
-
-        checksum ^= q0;
-        checksum = rotate(checksum, 5u) ^ q1;
-        checksum ^= (uint) as_ushort(s);
-
-        // Second 16 q values.
         const uint half_step = step + TILESIZE_K;
-        q_sub_offset =
-            row +
-            ((ne01 * half_step) >> 3) +
-            ((expert_id * ne00 * ne01) >> 3);
-
-        q0 = read_imageui(src0_q, q_sub_offset + sub_block_id_m).x;
-        q1 = read_imageui(src0_q, q_sub_offset + sub_block_id_m + ne01).x;
-
-        checksum = rotate(checksum, 7u) ^ q0;
-        checksum = rotate(checksum, 11u) ^ q1;
+        Q4_0_PROBE_8X4_PAIR(half_step, expert4_0, expert4_1);
+	Q4_0_PROBE_8X4_PAIR(half_step, expert4_2, expert4_3);
+        Q4_0_PROBE_8X4_PAIR(half_step, expert4_4, expert4_5);
+        Q4_0_PROBE_8X4_PAIR(half_step, expert4_6, expert4_7);
     }
 
     // Observable side effect: prevents dead-load elimination.
     sink[block_id_m * TILESIZE_M + get_local_id(0)] = checksum;
 }
+#undef Q4_0_PROBE_8X4_PAIR
+#undef Q4_0_PROBE_LOAD_EXPERT_16
 
 // Experimental grouped Q4_0 MoE GEMM for 8x4, 4x8 and 2x16 router layouts.
 // The work-group geometry remains 64 threads / TILESIZE_N=32. The 8x4 path

@@ -21686,6 +21686,17 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         fflush(stderr);
                         CL_CHECK(repeat_status);
                     }
+		    if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr) {
+                        ggml_cl_profile_q4_0_moe_weight_load(
+                            backend_ctx,
+                            extra0_q4_0->q_img,
+                            extra0_q4_0->d,
+                            buf_src2,
+                            buf_src2_emap,
+                            ne00,
+                            ne01,
+                            dst);
+                    }
                     clReleaseMemObject(sub_buf_src1_pre);
                     clReleaseMemObject(buf_src1_reordered);
                     clReleaseMemObject(image_src1_reordered);
